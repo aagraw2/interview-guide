@@ -1,4 +1,3 @@
-# Strategy Pattern
 
 ## Intent
 The Strategy pattern allows selecting an algorithm at runtime by encapsulating them in separate classes.

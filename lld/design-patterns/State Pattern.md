@@ -1,4 +1,3 @@
-# State Pattern
 
 ## Intent
 The State pattern changes object behavior based on internal state.

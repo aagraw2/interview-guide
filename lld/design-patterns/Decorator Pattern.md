@@ -1,4 +1,3 @@
-# Decorator Pattern
 
 ## Intent
 The Decorator pattern adds behavior to objects dynamically without modifying the original class.

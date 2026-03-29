@@ -1,5 +1,4 @@
-# Adapter Pattern
-
+ 
 ## Intent
 The Adapter pattern allows incompatible interfaces (classes that cannot directly work together) to collaborate.
 

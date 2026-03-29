@@ -1,4 +1,3 @@
-# Composite Pattern
 
 ## Intent
 The Composite pattern allows treating individual objects and groups uniformly (same interface for both).

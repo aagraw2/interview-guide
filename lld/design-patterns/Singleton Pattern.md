@@ -1,4 +1,3 @@
-# Singleton Pattern
 
 ## Intent
 This pattern ensures that only one instance of a class exists and provides a global access point (accessible from anywhere in code).

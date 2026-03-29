@@ -1,4 +1,3 @@
-# Command Pattern
 
 ## Intent
 The Command pattern encapsulates requests as objects, allowing parameterization and queuing.

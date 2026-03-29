@@ -1,4 +1,3 @@
-# Builder Pattern
 
 ## Intent
 The Builder pattern helps in constructing complex objects step by step. It separates object construction logic from representation (how the object is structured internally).

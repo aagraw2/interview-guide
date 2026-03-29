@@ -1,4 +1,3 @@
-# Chain of Responsibility Pattern
 
 ## Intent
 This pattern passes a request along a chain of handlers until it is processed.

@@ -1,4 +1,3 @@
-# Facade Pattern
 
 ## Intent
 The Facade pattern provides a simplified interface (single entry point) to a complex subsystem.

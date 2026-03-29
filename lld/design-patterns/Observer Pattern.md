@@ -1,4 +1,3 @@
-# Observer Pattern
 
 ## Intent
 The Observer pattern defines a one-to-many relationship where multiple objects are notified of changes.

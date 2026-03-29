@@ -1,4 +1,3 @@
-# Factory Pattern
 
 ## Intent
 The Factory pattern provides an interface for creating objects while allowing subclasses or logic to decide which object to create.
