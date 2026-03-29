@@ -1,12 +1,12 @@
 
 ## SOLID Principles
-[[SOLID Principles]]
+[SOLID Principles](lld/SOLID%20Principles.md)
 
 ## Design Patterns
-[[LLD Design Patterns]]
+[LLD Design Patterns](lld/LLD%20Design%20Patterns.md)
 
 ## Example Systems
- [[LLD Systems]]
+[LLD Systems](lld/LLD%20Systems.md)
 
 ---
 

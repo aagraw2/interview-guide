@@ -1,6 +1,6 @@
 
 ## DSA Practice Sheet
-[[DSA Practice Sheet]]
+[DSA Practice Sheet](dsa/DSA%20Practice%20Sheet.md)
 
 ---
 
