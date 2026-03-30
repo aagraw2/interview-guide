@@ -1,9 +1,30 @@
 
+# DRY, KISS, YAGNI
+[DRY, KISS, YAGNI](DRY,%20KISS,%20YAGNI.md)
+
 ## SOLID Principles
-[SOLID Principles](lld/SOLID%20Principles.md)
+[SOLID Principles](SOLID%20Principles.md)
+
+## Architecture Styles
+[Architecture Styles](Architecture%20Styles.md)
+
+## OOP Concepts
+[OOP Concepts](lld/OOP%20Concepts.md)
+
+## Concurrency Basics
+[Concurrency Basics](lld/Concurrency%20Basics.md)
+
+## Database Design Basics
+[Database Design Basics](lld/Database%20Design%20Basics.md)
+
+## API Design Basics
+[API Design Basics](lld/API%20Design%20Basics.md)
+
+## Domain Driven Design
+[Domain Driven Design](lld/Domain%20Driven%20Design.md)
 
 ## Design Patterns
-[LLD Design Patterns](lld/LLD%20Design%20Patterns.md)
+[Design Patterns](Design%20Patterns.md)
 
 ## Example Systems
 [LLD Systems](lld/LLD%20Systems.md)

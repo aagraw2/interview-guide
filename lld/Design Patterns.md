@@ -1,4 +1,6 @@
 
+## Pattern List
+
 | #   | Design Pattern                  | Type       | Notes                               |
 | --- | ------------------------------- | ---------- | ----------------------------------- |
 | 01  | Builder Pattern                 | Creational | [Builder Pattern](design-patterns/Builder%20Pattern.md)                 |
@@ -13,3 +15,8 @@
 | 10  | Command Pattern                 | Behavioral | [Command Pattern](design-patterns/Command%20Pattern.md)                 |
 | 11  | State Pattern                   | Behavioral | [State Pattern](design-patterns/State%20Pattern.md)                   |
 | 12  | Chain of Responsibility Pattern | Behavioral | [Chain Of Responsibility Pattern](design-patterns/Chain%20Of%20Responsibility%20Pattern.md) |
+
+---
+
+## Summary
+- Use these patterns to structure LLD designs and explain design intent quickly.

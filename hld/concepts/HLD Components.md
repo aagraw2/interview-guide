@@ -19,6 +19,7 @@
 | Distributed Locking            | P2       |       |       |
 | Distributed Scheduler          | P2       |       |       |
 | Circuit Breaker                | P2       |       |       |
+| File Upload/Download           | P2       |       |       |
 | Secrets Manager                | P2       |       |       |
 | Time Series DB                 | P2       |       |       |
 | Logging System                 | P2       |       |       |

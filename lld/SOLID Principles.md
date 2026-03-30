@@ -1,5 +1,8 @@
 
-## **1. Single Responsibility Principle (SRP)**
+## Overview
+SOLID are five design principles that help keep code maintainable by managing responsibilities and dependencies.
+
+## 1. Single Responsibility Principle (SRP)
 
 **Definition:**  
 A class should have only one reason to change. Each class handles **one responsibility**.
@@ -39,7 +42,7 @@ public class NotificationService {
 
 ---
 
-## **2. Open/Closed Principle (OCP)**
+## 2. Open/Closed Principle (OCP)
 
 **Definition:**  
 Software entities should be **open for extension, closed for modification**.
@@ -78,7 +81,7 @@ public class PayPal implements PaymentMethod {
 
 ---
 
-## **3. Liskov Substitution Principle (LSP)**
+## 3. Liskov Substitution Principle (LSP)
 
 **Definition:**  
 Subtypes must be substitutable for their base types without breaking behavior.
@@ -131,7 +134,7 @@ public class Square implements Shape {
 
 ---
 
-## **4. Interface Segregation Principle (ISP)**
+## 4. Interface Segregation Principle (ISP)
 
 **Definition:**  
 Clients should not be forced to depend on interfaces they do not use.
@@ -162,7 +165,7 @@ public interface Writer {
 
 ---
 
-## **5. Dependency Inversion Principle (DIP)**
+## 5. Dependency Inversion Principle (DIP)
 
 **Definition:**  
 High-level modules should not depend on low-level modules. Both should depend on **abstractions**.
@@ -207,3 +210,23 @@ public class UserService {
 - Tight coupling between modules reduces testability.
     
 
+---
+
+## Patterns Supporting SOLID in LLD
+
+|Principle|Patterns / Techniques|
+|---|---|
+|SRP|Adapter, Facade, Helper classes|
+|OCP|Strategy, Decorator, Template Method|
+|LSP|Polymorphism, Subclassing|
+|ISP|Interface Segregation, Multiple small interfaces|
+|DIP|Dependency Injection, Factory Pattern|
+
+---
+
+## Summary
+- **SRP**: one reason to change per class.
+- **OCP**: extend behavior without modifying existing code.
+- **LSP**: subtypes must remain substitutable.
+- **ISP**: prefer small, role-focused interfaces.
+- **DIP**: depend on abstractions; inject implementations.
