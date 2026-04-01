@@ -25,7 +25,7 @@
 | Logging Framework       | P2       | [Logging Framework Design](example-systems/Logging%20Framework%20Design.md)                                       |
 | File System             | P2       | [File System Design](example-systems/File%20System%20Design.md)                                                   |
 | Digital Wallet System   | P2       | [Digital Wallet System Design](example-systems/Digital%20Wallet%20System%20Design.md)                             |
-| Payment System          | P2       | [Payment System Design](Payment%20System%20Design.md)                                                                             |
+| Payment System          | P2       | [Payment System Design](example-systems/Payment%20System%20Design.md)                                                                             |
 | Ledger System           | P2       | [Ledger System (Double Entry Accounting)](example-systems/Ledger%20System%20%28Double%20Entry%20Accounting%29.md) |
 | Task Scheduler          | P3       | [Task Scheduler System Design](example-systems/Task%20Scheduler%20System%20Design.md)                             |
 | Feature Toggle System   | P3       | [Feature Toggle System Design](example-systems/Feature%20Toggle%20System%20Design.md)                             |

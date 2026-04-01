@@ -1,12 +1,12 @@
 
 # DRY, KISS, YAGNI
-[DRY, KISS, YAGNI](DRY,%20KISS,%20YAGNI.md)
+[DRY, KISS, YAGNI](lld/DRY,%20KISS,%20YAGNI.md)
 
 ## SOLID Principles
-[SOLID Principles](SOLID%20Principles.md)
+[SOLID Principles](lld/SOLID%20Principles.md)
 
 ## Architecture Styles
-[Architecture Styles](Architecture%20Styles.md)
+[Architecture Styles](lld/Architecture%20Styles.md)
 
 ## OOP Concepts
 [OOP Concepts](lld/OOP%20Concepts.md)
@@ -24,7 +24,7 @@
 [Domain Driven Design](lld/Domain%20Driven%20Design.md)
 
 ## Design Patterns
-[Design Patterns](Design%20Patterns.md)
+[Design Patterns](lld/Design%20Patterns.md)
 
 ## Example Systems
 [LLD Systems](lld/LLD%20Systems.md)
