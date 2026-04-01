@@ -1,9 +1,9 @@
 
 ## Components
-[HLD Components](hld/concepts/HLD%20Components.md)
+[HLD Concepts](HLD%20Concepts.md)
 
 ## Example Systems
-[HLD Systems](hld/example-systems/HLD%20Systems.md)
+[HLD Systems](HLD%20Systems.md)
 
 ---
 
