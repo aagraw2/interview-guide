@@ -9,40 +9,42 @@
     
 
 
-| Priority | System / Product              | Category / Type                      | Notes | Video Tutorial                                      |
-| -------- | ----------------------------- | ------------------------------------ | ----- | --------------------------------------------------- |
-| P1       | Chat System                   | Communication / Realtime             |       | https://www.youtube.com/watch?v=3HXFy_7M12E&t=3404s |
-| P1       | Ticket Booking System         | E-commerce / Booking                 |       |                                                     |
-| P1       | Ecommerce                     | E-commerce / Marketplace             |       |                                                     |
-| P1       | YouTube                       | Media / Streaming                    |       |                                                     |
-| P1       | Short Video Platform (TikTok) | Media / Streaming                    |       |                                                     |
-| P1       | Stock Trading System          | Finance / Low Latency                |       |                                                     |
-| P1       | News Feed                     | Media / Feed                         |       |                                                     |
-| P1       | Payment System                | Finance / Transaction                |       |                                                     |
-| P1       | Digital Wallet                | Finance / Transaction                |       |                                                     |
-| P1       | Google Docs                   | Collaboration / Realtime             |       | https://www.youtube.com/watch?v=-eMtcFqj8vI         |
-| P1       | Food Delivery                 | E-commerce / Logistics               |       |                                                     |
-| P1       | Ride Matching (Uber/Ola)      | E-commerce / Logistics               |       |                                                     |
-| P2       | URL Shortener                 | Utility / Storage                    |       |                                                     |
-| P2       | Netflix                       | Media / Streaming                    |       |                                                     |
-| P2       | Facebook                      | Social Network                       |       |                                                     |
-| P2       | Leaderboard                   | Gaming / Ranking                     |       |                                                     |
-| P2       | S3-like Storage               | Storage / Cloud                      |       |                                                     |
-| P2       | Live Streaming                | Media / Streaming                    |       |                                                     |
-| P2       | Google Maps                   | Location / Map Service               |       |                                                     |
-| P2       | Job Scheduler                 | Infrastructure / Distributed Systems |       |                                                     |
-| P2       | Google Drive                  | Storage / Cloud                      |       |                                                     |
-| P2       | Hotel Reservation             | E-commerce / Booking                 |       |                                                     |
-| P3       | Reconciliation System         | Finance / Data Integrity             |       |                                                     |
-| P3       | Payout System                 | Finance / Transaction                |       |                                                     |
-| P3       | Escrow System                 | Finance / Transaction                |       |                                                     |
-| P3       | Email Service                 | Communication / Distributed Systems  |       |                                                     |
-| P3       | Recommendation System         | Analytics / Machine Learning         |       |                                                     |
-| P3       | Search Engine                 | Information Retrieval                |       |                                                     |
-| P3       | Multi-tenant SaaS             | Enterprise / Architecture            |       |                                                     |
-| P3       | MyGate                        | Security / PropTech                  |       |                                                     |
-| P3       | Ad Click Aggregation          | Analytics / Streaming                |       |                                                     |
-| P3       | Whiteboard                    | Collaboration / Realtime             |       |                                                     |
+| Priority | System / Product              | Notes | Video Tutorial                                      |
+| -------- | ----------------------------- | ----- | --------------------------------------------------- |
+| P1       | Chat System                   |       | https://www.youtube.com/watch?v=3HXFy_7M12E&t=3404s |
+| P1       | Ticket Booking System         |       |                                                     |
+| P1       | Ecommerce                     |       |                                                     |
+| P1       | YouTube                       |       |                                                     |
+| P1       | Short Video Platform (TikTok) |       |                                                     |
+| P1       | Stock Trading System          |       |                                                     |
+| P1       | News Feed                     |       |                                                     |
+| P1       | Payment System                |       |                                                     |
+| P1       | Digital Wallet                |       |                                                     |
+| P1       | Google Docs                   |       | https://www.youtube.com/watch?v=-eMtcFqj8vI         |
+| P1       | Food Delivery                 |       |                                                     |
+| P1       | Ride Matching (Uber/Ola)      |       |                                                     |
+| P2       | URL Shortener                 |       |                                                     |
+| P2       | Netflix                       |       |                                                     |
+| P2       | Facebook                      |       |                                                     |
+| P2       | Leaderboard                   |       |                                                     |
+| P2       | S3-like Storage               |       |                                                     |
+| P2       | Live Streaming                |       |                                                     |
+| P2       | Google Maps                   |       |                                                     |
+| P2       | Job Scheduler                 |       |                                                     |
+| P2       | Google Drive                  |       |                                                     |
+| P2       | Hotel Reservation             |       |                                                     |
+| P2       | Leetcode                      |       |                                                     |
+| P3       | Git                           |       |                                                     |
+| P3       | Reconciliation System         |       |                                                     |
+| P3       | Payout System                 |       |                                                     |
+| P3       | Escrow System                 |       |                                                     |
+| P3       | Email Service                 |       |                                                     |
+| P3       | Recommendation System         |       |                                                     |
+| P3       | Search Engine                 |       |                                                     |
+| P3       | Multi-tenant SaaS             |       |                                                     |
+| P3       | MyGate                        |       |                                                     |
+| P3       | Ad Click Aggregation          |       |                                                     |
+| P3       | Whiteboard                    |       |                                                     |
 
 ---
 
