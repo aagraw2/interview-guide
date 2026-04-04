@@ -1,7 +1,7 @@
 # Payment System Design
 
 ## System Overview
-A payment processing platform (think Stripe / Razorpay / PayPal) that processes card payments, bank transfers, and digital wallet transactions — handling authorization, capture, settlement, refunds, and fraud detection with strong consistency and PCI-DSS compliance.
+A payment gateway platform (think Stripe / Razorpay) that processes card payments through a PaymentIntent → Checkout Session → PCI-scoped tokenization → Processor Connector pipeline — handling authorization, capture, settlement, refunds, and fraud detection with strong consistency and PCI-DSS compliance.
 
 ## Architecture Diagram
 #### (To be inserted)
@@ -9,21 +9,24 @@ A payment processing platform (think Stripe / Razorpay / PayPal) that processes 
 ## 1. Requirements
 
 ### Functional Requirements
-- Accept payments via card (credit/debit), bank transfer, UPI, wallet
+- Merchant onboarding and API key management
+- Create payment intents and hosted checkout sessions
+- Accept card payments with PCI-compliant tokenization
+- Route payments to multiple processor connectors (Razorpay, PayU, Fiserv)
 - Payment authorization and capture (two-step for cards)
+- Async callback handling from processors
 - Refunds (full and partial)
 - Recurring payments / subscriptions
 - Payout to merchants
-- Payment status tracking
-- Fraud detection and prevention
-- Multi-currency support
+- Payment status tracking and webhooks to merchants
+- Reconciliation with processors (T+1)
 
 ### Non-Functional Requirements
 - Availability: 99.999% — payment downtime = revenue loss
 - Latency: <500ms for payment authorization
 - Consistency: Strong — no double charge, no missed payment
 - Durability: Every payment event permanently recorded
-- Security: PCI-DSS Level 1 compliance, tokenization, encryption
+- Security: PCI-DSS Level 1 compliance, HSM-backed tokenization, TLS everywhere
 - Idempotency: Retried payments must not result in double charge
 
 ## 2. Back-of-the-Envelope Estimation
@@ -40,7 +43,7 @@ A payment processing platform (think Stripe / Razorpay / PayPal) that processes 
 Transactions/sec (avg)  = 10M / 86400 ≈ 116/sec
 Transactions/sec (peak) = 100M / 86400 ≈ 1157/sec
 
-Authorization calls     = 1157/sec to card networks (Visa/Mastercard)
+Processor API calls     = 1157/sec to Razorpay/PayU/Fiserv
 ```
 
 ### Storage
@@ -52,39 +55,58 @@ Audit log               = 10M × 500B = 5GB/day
 
 ## 3. Core Components
 
-**API Gateway** — Auth, rate limiting, routing; TLS termination; PCI-DSS boundary
+**API Gateway & Load Balancer** — Auth (API key / JWT), rate limiting, routing, TLS termination; PCI-DSS boundary for all inbound traffic
 
-**Payment API Service** — Entry point for payment requests; validates; creates payment record; publishes to Kafka; returns immediately (async for some flows)
+**PaymentIntent Service** — First step in the payment flow; merchant creates a payment intent with amount, currency, order details; returns `payment_intent_id`; writes to PaymentIntent DB
 
-**Authorization Service** — Calls card network (Visa/Mastercard) or bank for authorization; handles 3DS (3D Secure) for card payments
+**Checkout Session Service** — Creates a checkout session tied to a payment intent; stores session state in Redis with TTL; returns a hosted checkout URL (`https://pay.gateway.com/checkout/sess_{id}`); validates: session exists, not expired, intent valid, merchant matched, session ACTIVE
 
-**Capture Service** — Captures authorized amount (for two-step card payments); called after merchant confirms order
+**Checkout Frontend Service** — Serves the hosted checkout HTML/JS page at the session URL; client-side card form; never touches raw card data on merchant's servers (PCI scope reduction)
 
-**Refund Service** — Processes full/partial refunds; calls card network or bank for reversal
+**Checkout Backend Service** — Handles checkout form submission; validates session state before processing; calls Tokenization Service in PCI Zone; calls Orchestrator Service
 
-**Fraud Detection Service** — Real-time scoring per transaction; blocks high-risk payments; ML-based + rule-based
+**PCI Zone — Tokenization Service** — Isolated zone with strict network controls; four steps:
+1. Validate request
+2. Generate card fingerprint (hash of PAN for dedup)
+3. Vault card in HSM (Hardware Security Module)
+4. Encrypt card using HSM → return `encrypted_card_token`
 
-**Tokenization Service** — Replaces sensitive card data (PAN) with tokens; PCI-DSS scope reduction; stores card data in secure vault
+**Orchestrator Service** — Routes payment to the correct processor connector based on merchant config, currency, payment method; reads session data from Redis; calls Processor Gateway
 
-**Settlement Service** — Batches transactions for settlement with card networks; T+1 or T+2 settlement
+**Processor Gateway** — Abstraction layer over multiple payment processors; routes to connector services
 
-**Payout Service** — Disburses funds to merchants; see Payout System Design
+**Connector Services** — Adapters to specific processors:
+- `RazorPayConnectorSvc` → Razorpay API
+- `PayUConnectorSvc` → PayU API
+- `FiservConnectorSvc` → Fiserv API
+
+**Collector Callback Service** — Receives async callbacks from payment processors (success/failure); publishes to Kafka `payment.processor.callback.status` topic
+
+**Fraud Detection Service** — Real-time scoring per transaction; blocks high-risk payments; ML-based + rule-based velocity checks
+
+**Refund Service** — Processes full/partial refunds via processor connectors
+
+**Settlement Service** — T+1 batch settlement with processors; reconciles via Reconciliation Service
+
+**Reconciliation Service** — Compares Payment Processor DB records with processor reports; flags discrepancies
 
 **Ledger Service** — Double-entry bookkeeping; immutable record of all fund movements
 
-**Webhook Service** — Delivers payment status updates to merchants via webhooks
+**Webhook Service** — Delivers payment status updates to merchants; Kafka-backed with retry
 
-**Payment DB (PostgreSQL)** — Payment records, status, metadata
+**PaymentIntent DB (PostgreSQL)** — `payment_intent_id, status (SENT/DONE), amount, currency, merchant_id, payment_method, order_id, customer, card_token, metadata`
+
+**Payment Processor DB (PostgreSQL)** — Processor-level records: `txn_id, intent_id, status (SENT/DONE), amount, currency, merchant_id, payment_method, card_token, metadata`
+
+**Merchant DB (PostgreSQL)** — Merchant profiles, API keys, processor routing config, fee structure
+
+**Card DB (HSM-backed Vault)** — Encrypted card data; Hardware Security Module for key management; isolated in PCI Zone
 
 **Ledger DB (PostgreSQL)** — Immutable double-entry ledger
 
-**Card Vault (HSM-backed)** — Encrypted card data storage; Hardware Security Module for key management
+**Redis** — Checkout session state (TTL), idempotency keys, fraud velocity signals, payment status cache
 
-**Audit Log (Cassandra)** — Immutable audit trail; every action logged
-
-**Redis** — Idempotency keys, payment state cache, fraud signals, rate limiting
-
-**Kafka** — Payment events, settlement batches, webhook delivery, fraud events
+**Kafka** — `payment.processor.callback.status` (async processor callbacks), `payment.processor.status` (T+1 settlement status)
 
 ## 4. Database Design
 
@@ -92,41 +114,46 @@ Audit log               = 10M × 500B = 5GB/day
 
 | Store | Why |
 |---|---|
-| PostgreSQL (Payment DB) | ACID for payment state transitions; relational queries; audit |
+| PostgreSQL (PaymentIntent DB) | ACID for intent state transitions; relational |
+| PostgreSQL (Payment Processor DB) | Processor-level records; reconciliation queries |
+| PostgreSQL (Merchant DB) | Merchant config, routing rules, ACID |
 | PostgreSQL (Ledger DB) | Immutable double-entry; financial compliance |
-| Cassandra (Audit Log) | Append-only, high write throughput, immutable |
-| Redis | Idempotency keys (TTL), payment state cache, fraud velocity checks |
-| HSM-backed Vault | PCI-DSS requirement for card data; hardware encryption |
+| HSM-backed Card Vault | PCI-DSS requirement; hardware encryption; isolated network zone |
+| Redis | Session state (TTL), idempotency keys, fraud velocity checks |
+| Kafka | Async processor callbacks; T+1 settlement events |
 
-### PostgreSQL — payments
+### PostgreSQL — payment_intents
 
 | Field | Type |
 |---|---|
-| payment_id | UUID (PK) |
-| merchant_id | UUID |
-| customer_id | UUID, nullable |
+| payment_intent_id | UUID (PK) |
+| status | ENUM (SENT / DONE / FAILED / CANCELLED) |
 | amount | DECIMAL(18,2) |
 | currency | VARCHAR(3) |
-| status | ENUM (created / authorized / captured / failed / refunded / cancelled) |
-| payment_method | ENUM (card / upi / bank / wallet) |
-| card_token | VARCHAR, nullable (token, not actual card) |
-| authorization_code | VARCHAR, nullable |
-| network_txn_id | VARCHAR, nullable |
-| idempotency_key | VARCHAR, unique |
-| failure_reason | TEXT, nullable |
+| merchant_id | UUID |
+| payment_method | ENUM (CARD / UPI / BANK / WALLET) |
+| order_id | UUID |
+| customer | JSONB |
+| card_token | VARCHAR, nullable |
+| metadata | JSONB |
 | created_at | TIMESTAMP |
 | updated_at | TIMESTAMP |
 
-### PostgreSQL — refunds
+### PostgreSQL — payment_processor_records
 
 | Field | Type |
 |---|---|
-| refund_id | UUID (PK) |
-| payment_id | UUID (FK → payments) |
+| txn_id | UUID (PK) |
+| intent_id | UUID (FK → payment_intents) |
+| status | ENUM (SENT / DONE / FAILED) |
 | amount | DECIMAL(18,2) |
-| status | ENUM (pending / success / failed) |
-| reason | TEXT |
-| network_refund_id | VARCHAR, nullable |
+| currency | VARCHAR(3) |
+| merchant_id | UUID |
+| payment_method | VARCHAR |
+| card_token | VARCHAR |
+| processor | VARCHAR (razorpay / payu / fiserv) |
+| processor_txn_id | VARCHAR |
+| metadata | JSONB |
 | created_at | TIMESTAMP |
 
 ### PostgreSQL — ledger (immutable)
@@ -134,8 +161,8 @@ Audit log               = 10M × 500B = 5GB/day
 | Field | Type |
 |---|---|
 | entry_id | UUID (PK) |
-| payment_id | UUID |
-| account_type | ENUM (customer / merchant / platform / card_network) |
+| txn_id | UUID |
+| account_type | ENUM (customer / merchant / platform / processor) |
 | entry_type | ENUM (debit / credit) |
 | amount | DECIMAL(18,2) |
 | currency | VARCHAR |
@@ -146,166 +173,206 @@ Audit log               = 10M × 500B = 5GB/day
 
 | Key Pattern | Type | Value | TTL |
 |---|---|---|---|
-| `idempotency:{key}` | String | payment_id | 86400s |
-| `payment:status:{paymentId}` | String | status JSON | 300s |
+| `checkout:session:{sessionId}` | String | session state JSON | 1800s (30 min) |
+| `idempotency:{key}` | String | txn_id | 86400s |
 | `fraud:velocity:{customerId}` | Counter | txn count in window | 3600s |
 | `fraud:velocity:{ip}` | Counter | txn count in window | 3600s |
+| `payment:status:{intentId}` | String | status JSON | 300s |
 
 ## 5. Key Flows
 
-### 5.1 Card Payment — Authorization + Capture (Two-Step)
+### 5.1 Full Payment Flow (Card)
 
 ```
-Merchant → Payment API Service
+Merchant → PaymentIntent Service → PaymentIntent DB
+                ↓ (returns payment_intent_id)
+         Checkout Session Service → Redis (session state)
+                ↓ (returns hosted checkout URL)
+         Customer opens URL → Checkout Frontend Service (HTML/JS)
+                ↓ (customer enters card details)
+         Checkout Backend Service
+           - validate session (Redis)
+           - call Tokenization Service (PCI Zone)
+                ↓ (returns encrypted_card_token)
+         Orchestrator Service → Processor Gateway
+           → RazorPayConnectorSvc / PayUConnectorSvc / FiservConnectorSvc
+                ↓ (async callback)
+         Collector Callback Service → Kafka (payment.processor.callback.status)
                 ↓
-    Idempotency check (Redis)
-                ↓
-    Tokenize card (if raw card data) → Card Vault
-                ↓
-    Fraud Detection Service (sync, <100ms)
-                ↓
-    Authorization Service → Card Network (Visa/MC)
-                ↓
-    On auth success: payment.status = authorized
-                ↓
-    Merchant confirms order → Capture Service → Card Network
-                ↓
-    On capture: payment.status = captured
-    Ledger entries written
-    Webhook sent to merchant
+         Payment Processor DB updated
+         Ledger entries written
+         Webhook to merchant
 ```
 
-**Authorization:**
-1. Merchant sends `POST /payments` with `{amount, currency, cardToken, idempotencyKey}`
-2. Idempotency check: `SET idempotency:{key} 1 NX EX 86400` — if exists, return cached result
-3. Tokenization: if raw card number provided, tokenize → store in vault, use token
-4. Fraud Detection: score transaction (<100ms); block if high risk
-5. Authorization Service calls Visa/Mastercard API: "Can this card pay $X?"
-6. Card network checks: card valid, sufficient funds, not blocked
-7. On approval: `authorization_code` returned; `payment.status = authorized`
-8. Funds held on customer's card (not yet transferred)
+**Step by step:**
 
-**Capture:**
-9. Merchant confirms order shipped → `POST /payments/{id}/capture`
-10. Capture Service calls card network: "Collect the authorized $X"
-11. On success: `payment.status = captured`; ledger entries written
-12. Funds transferred from customer to merchant (via settlement)
+1. Merchant calls `POST /payment-intents` with `{amount, currency, orderId, customer}`
+2. PaymentIntent Service creates intent (`status = SENT`), returns `payment_intent_id`
+3. Merchant calls `POST /checkout-sessions` with `payment_intent_id`
+4. Checkout Session Service creates session in Redis (TTL 30 min), returns hosted URL
+5. Customer opens URL → Checkout Frontend serves card form (merchant's domain never sees card data)
+6. Customer submits card → Checkout Backend validates session state:
+   - Session exists in Redis
+   - Not expired
+   - Intent valid and matches
+   - Merchant matched
+   - Session state is ACTIVE
+7. Checkout Backend calls Tokenization Service (PCI Zone):
+   - Validate request
+   - Generate card fingerprint
+   - Vault card in HSM
+   - Return `encrypted_card_token`
+8. Checkout Backend calls Orchestrator with `{intentId, cardToken, amount}`
+9. Orchestrator reads merchant routing config from Merchant DB
+10. Routes to appropriate Connector (e.g., RazorPayConnectorSvc)
+11. Connector calls Razorpay API synchronously or async
+12. Processor responds → Collector Callback Service receives callback
+13. Publishes to Kafka `payment.processor.callback.status`
+14. Consumer updates Payment Processor DB, PaymentIntent DB (`status = DONE`)
+15. Ledger entries written; webhook sent to merchant
 
-**Why two-step?**
-Authorization holds funds without transferring. Capture transfers. Allows merchants to authorize at order time and capture at shipment — customer isn't charged until goods are sent.
+### 5.2 Session Validation (Checkout Backend)
 
-### 5.2 UPI / Bank Transfer
+Before processing any payment, Checkout Backend validates:
+- Session exists in Redis (not expired)
+- `intent_id` in session matches request
+- `merchant_id` in session matches API key
+- Session `state = ACTIVE` (not already used or cancelled)
 
-1. Customer initiates UPI payment → Payment API Service
-2. Fraud check
-3. UPI Service calls NPCI (National Payments Corporation of India) UPI API
-4. Customer approves on their UPI app (push notification)
-5. NPCI confirms → `payment.status = captured` (UPI is single-step, no separate capture)
-6. Ledger entries written; webhook to merchant
+This prevents replay attacks, session hijacking, and double-processing.
 
-### 5.3 Refund Flow
+### 5.3 PCI Zone — Tokenization
 
-1. Merchant initiates refund: `POST /payments/{id}/refund` with `{amount}`
-2. Refund Service validates: payment is captured, refund amount ≤ original amount
-3. Calls card network / bank for reversal
-4. On success: write refund record; update payment status; write ledger credit entry
-5. Funds returned to customer (T+3–5 days for cards)
-6. Webhook to merchant
+The PCI Zone is an isolated network segment with strict ingress/egress rules. Only Checkout Backend can call into it. Steps:
+1. Validate request (required fields, format)
+2. Generate card fingerprint: `SHA256(PAN + expiry)` — used to detect duplicate cards without storing PAN
+3. Vault: store encrypted PAN in HSM-backed Card DB
+4. Encrypt card token using HSM key → return `encrypted_card_token`
 
-### 5.4 Fraud Detection
+The token is what flows through all other systems. Raw PAN never leaves the PCI Zone.
 
-Real-time checks on every transaction:
-- **Velocity checks:** `INCR fraud:velocity:{customerId}` — if > 10 txns/hr → flag
-- **IP velocity:** `INCR fraud:velocity:{ip}` — if > 50 txns/hr from same IP → block
-- **Amount anomaly:** transaction amount >> customer's historical average → flag
-- **Card BIN check:** card issuer country vs customer location mismatch → flag
-- **ML model:** trained on historical fraud patterns; scores 0–100; >80 = block, 50–80 = 3DS challenge
+### 5.4 Processor Connector Pattern
 
-### 5.5 3D Secure (3DS)
+Orchestrator selects connector based on:
+- Merchant's preferred processor
+- Payment method (some processors don't support all methods)
+- Currency (some processors are region-specific)
+- Failover: if primary processor is down, route to secondary
 
-For medium-risk transactions, redirect customer to card issuer for additional authentication (OTP, biometric):
-1. Authorization Service detects 3DS required
-2. Return 3DS redirect URL to merchant
-3. Customer completes 3DS on issuer's page
-4. Issuer returns authentication result
-5. Authorization Service proceeds with auth using 3DS result
-6. Liability shifts to issuer if fraud occurs (merchant protected)
+Each connector is an independent service — adding a new processor (e.g., Stripe) means adding a new connector without changing Orchestrator logic.
 
-### 5.6 Settlement
+### 5.5 Async Callback Handling
 
-Daily batch process:
-1. Settlement Service queries all `captured` payments from previous day
-2. Groups by card network (Visa, Mastercard, etc.)
-3. Submits settlement file to each network
-4. Networks transfer funds to platform's bank account (T+1)
-5. Platform disburses to merchants (T+2) via Payout Service
+Processors often respond asynchronously (especially for bank transfers, UPI):
+1. Connector sends payment request to processor
+2. Processor returns `202 Accepted` with `processor_txn_id`
+3. Processor later sends callback to Collector Callback Service
+4. Collector validates callback signature (HMAC)
+5. Publishes to Kafka `payment.processor.callback.status`
+6. Consumer updates Payment Processor DB and PaymentIntent DB
+7. Webhook sent to merchant
+
+### 5.6 Refund Flow
+
+1. Merchant calls `POST /payments/{intentId}/refund`
+2. Refund Service validates: intent is DONE, refund amount ≤ original
+3. Calls appropriate Connector to initiate refund at processor
+4. Processor confirms → update records, write ledger credit entry
+5. Webhook to merchant
+
+### 5.7 T+1 Reconciliation
+
+1. Settlement Service runs daily batch
+2. Downloads settlement report from each processor
+3. Reconciliation Service compares Payment Processor DB records with report
+4. Flags discrepancies (missing transactions, amount mismatches)
+5. Publishes `payment.processor.status` events to Kafka
+6. Finance team reviews flagged items
 
 ## 6. Key Interview Concepts
 
-### Idempotency is Critical
+### PaymentIntent Pattern (Stripe-style)
+Creating a PaymentIntent before checkout separates "intent to pay" from "actual payment". Benefits:
+- Merchant can create intent server-side without exposing API keys to frontend
+- Intent can be updated (amount change, currency change) before checkout
+- Idempotent: same intent can be retried without creating duplicate charges
+- Status tracking: `SENT → DONE / FAILED` gives clear lifecycle
+
+### Hosted Checkout (PCI Scope Reduction)
+If merchant's frontend handles card data, they're in PCI scope (expensive audit). Hosted checkout: card form is served from the payment gateway's domain. Merchant's servers never see raw card data. Merchant is out of PCI scope. This is how Stripe Checkout and Razorpay's hosted page work.
+
+### PCI Zone Isolation
+The Tokenization Service and Card DB live in a strictly isolated network zone:
+- Only Checkout Backend can call in (no direct internet access)
+- HSM (Hardware Security Module) handles all encryption/decryption
+- Card fingerprint enables dedup without storing PAN elsewhere
+- Audit logs of every vault access
+
+### Connector Pattern for Multi-Processor
+Different processors have different APIs, auth mechanisms, and response formats. Connector Services abstract this:
+- Orchestrator speaks one internal interface
+- Each connector translates to processor-specific protocol
+- Adding a new processor = new connector, no Orchestrator changes
+- Failover: Orchestrator can retry on a different connector if one fails
+
+### Idempotency
 Network timeout → merchant retries → risk of double charge. Solution:
 - Merchant generates `idempotency_key` before first attempt
-- Payment API stores key in Redis (24hr TTL) and DB (unique constraint)
+- Stored in Redis (24hr TTL) and DB (unique constraint)
 - On retry: same key → return original result, no new charge
-- Card networks also support idempotency keys — pass through
-
-### Tokenization & PCI-DSS
-Storing raw card numbers (PAN) requires PCI-DSS Level 1 compliance — extremely expensive. Solution: tokenize immediately on receipt. Replace PAN with a random token. Store PAN in HSM-backed vault (separate, highly secured system). All other systems use tokens — they're outside PCI scope.
-
-### Authorization vs Capture
-Authorization: "Can this card pay $X?" — funds held, not transferred. Capture: "Transfer the $X." — funds moved. Two-step allows:
-- Pre-authorization for hotels/car rentals (hold funds, capture actual amount later)
-- Capture only on shipment (customer not charged for cancelled orders)
-- Partial capture (order partially fulfilled)
+- Connectors pass idempotency key to processors (processors also support it)
 
 ### Double-Entry Ledger
 Every payment creates multiple ledger entries:
 ```
 Card payment $100:
   DEBIT  customer_account    $100
-  CREDIT platform_holding    $100  (during settlement period)
-  
+  CREDIT platform_holding    $100
+
 On settlement:
   DEBIT  platform_holding    $97   (after 3% fee)
   CREDIT merchant_account    $97
   DEBIT  platform_holding    $3
-  CREDIT platform_revenue    $3    (fee)
+  CREDIT platform_revenue    $3
 ```
 
-### Saga Pattern for Payment + Order
-Payment and order creation are separate services. If payment succeeds but order creation fails:
-- Compensating transaction: refund the payment
-- Kafka events: `PAYMENT_CAPTURED` → Order Service creates order; if fails → `ORDER_FAILED` → Payment Service refunds
+### Tokenization & PCI-DSS
+Storing raw card numbers (PAN) requires PCI-DSS Level 1 compliance. Solution: tokenize immediately. Replace PAN with a random token. Store PAN only in HSM-backed vault. All other systems use tokens — they're outside PCI scope.
 
-### Webhook Reliability
-Merchants need payment status updates. Webhooks must be delivered reliably:
-- Kafka consumer delivers webhooks
-- Retry with exponential backoff (1min, 5min, 30min, 2hr, 24hr)
-- Dead letter queue after max retries
-- Merchant can also poll `GET /payments/{id}` for status
+### Authorization vs Capture
+Authorization: "Can this card pay $X?" — funds held, not transferred. Capture: "Transfer the $X." Two-step allows:
+- Pre-authorization for hotels/car rentals
+- Capture only on shipment
+- Partial capture
 
 ## 7. Failure Scenarios
 
-### Card Network Timeout
-- Detection: no response within 3s
-- Recovery: retry with same idempotency key; card network returns same result if already processed; after 3 retries, return `payment_failed`
-- Prevention: idempotency key prevents double charge on retry
+### Processor Timeout (Async Callback Not Received)
+- Detection: no callback within SLA (e.g., 30s for card, 5min for UPI)
+- Recovery: poll processor status API; if confirmed, update DB; if not, mark as failed and retry
+- Prevention: idempotency key prevents double charge on retry; Kafka retains callback events
 
-### Fraud Service Failure
-- Recovery: fail open (allow payment with enhanced logging) or fail closed (block) based on risk tolerance; circuit breaker; Fraud Service is stateless, restarts quickly
-- Prevention: multiple Fraud Service instances; cached fraud signals in Redis survive brief outage
+### Checkout Session Expired
+- Scenario: customer takes >30 min to complete checkout
+- Recovery: return session expired error; merchant creates new session; customer re-enters card
+- Prevention: 30-min TTL is generous; warn customer at 25 min
+
+### Tokenization Service (PCI Zone) Failure
+- Impact: new card payments fail; existing token payments work
+- Recovery: HSM-backed vault is highly available (multi-AZ); brief unavailability → queue checkout requests
+- Prevention: multiple HSM instances; geographic redundancy; PCI Zone has its own HA setup
+
+### Orchestrator Routes to Wrong Processor
+- Scenario: processor routing config stale in cache
+- Recovery: Orchestrator reads fresh config from Merchant DB on cache miss; connector returns error → retry on alternate processor
+- Prevention: short cache TTL for routing config; circuit breaker per connector
+
+### Reconciliation Discrepancy
+- Scenario: payment shows DONE in our DB but missing in processor's settlement report
+- Recovery: Reconciliation Service flags it; finance team investigates; may be timing difference (T+1 vs T+2)
+- Prevention: retain raw processor callbacks; compare against settlement report; alert on discrepancy rate > 0.1%
 
 ### PostgreSQL Failure
-- Impact: payment writes fail; Kafka events not acknowledged
+- Impact: payment writes fail; Kafka callbacks not acknowledged
 - Recovery: promote replica (<30s); retry from Kafka; idempotency prevents duplicates
 - Prevention: synchronous replication; automated failover
-
-### Settlement Failure
-- Impact: merchants not paid on time
-- Recovery: retry settlement file submission; manual intervention if persistent
-- Prevention: settlement is idempotent (same file = same result); monitor settlement status
-
-### Tokenization Vault Failure
-- Impact: new card payments fail (can't tokenize); existing token payments work
-- Recovery: vault is highly available (HSM-backed, multi-AZ); brief unavailability → queue new card payments
-- Prevention: vault is the most hardened component; multiple HSM instances; geographic redundancy

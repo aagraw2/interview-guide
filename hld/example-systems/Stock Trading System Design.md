@@ -54,37 +54,49 @@ Portfolio records   = 10M users × 100 holdings × 200B = 200GB
 
 ## 3. Core Components
 
-**API Gateway** — Auth, rate limiting, routing; strict rate limits per user (prevent order flooding)
+**LB + API Gateway** — Auth, rate limiting, routing, round-robin; strict rate limits per user (prevent order flooding)
 
-**User Service** — Registration, KYC, account management; writes to User DB
+**WebSocket Gateway** — Separate from API Gateway; handles persistent WebSocket connections with session stickiness; used by Price Tracker Service and order status updates
 
-**Order Service** — Receives and validates orders; writes to Order DB; publishes to Order Queue (Kafka); returns `orderId` immediately
+**User Service** — Registration, KYC verification, account management; writes to User DB (stores encrypted PAN, bank details, portfolio metadata)
 
-**Order Matching Engine** — The core component; in-memory order book per stock; matches buy/sell orders by price-time priority; produces trade events; single-threaded per stock for consistency
+**Order Service** — Receives and validates orders; writes to Order DB; publishes to Kafka `raw_orders` topic; returns `orderId` immediately
 
-**Trade Service** — Consumes trade events; updates portfolio, deducts funds, records trade; writes to Trade DB
+**Validator** — Kafka consumer on `raw_orders`; performs risk checks (sufficient funds, position limits, circuit breakers, KYC status); publishes to `verified_orders` or `rejected_orders` topics; separating validation from order placement keeps Order Service fast and stateless
 
-**Market Data Service** — Receives price ticks from exchange feed; distributes to subscribers via WebSocket/SSE; updates Redis with latest prices
+**Order Tracker Service** — Consumes `verified_orders`; places orders on the exchange via Exchange Gateway; receives order status updates back from exchange (filled, partially filled, rejected); updates Order DB and publishes to Kafka `order_status` topic
 
-**Portfolio Service** — Manages user holdings and P&L; reads from Portfolio DB; updated by Trade Service
+**Exchange Gateway** — Dedicated adapter to NSE/BSE; maintains persistent WebSocket connections to the exchange (400–500 symbols/ws); translates internal order format to exchange protocol (FIX/proprietary); receives live price feeds and order acknowledgements; the only component that talks directly to the exchange
 
-**Risk Service** — Pre-trade risk checks: sufficient funds, position limits, circuit breakers; called synchronously before order acceptance
+**Price Ingester Service** — Consumes live price updates from Exchange Gateway; writes historical ticks to InfluxDB; publishes to Kafka `stock_price` topic for downstream consumers
 
-**Settlement Service** — T+2 settlement; transfers actual shares and funds between accounts
+**Price Tracker Service (WebSocket Server)** — Subscribes to Redis Pub/Sub channels per stock symbol; pushes real-time price updates to connected clients via WebSocket; users subscribe to specific symbols they care about
 
-**Notification Service** — Kafka consumer; sends order confirmation, trade execution, price alerts
+**WatchList Service** — Manages user watchlists (add/remove symbols); reads/writes to Watch DB; used by Price Tracker to know which symbols a user is subscribed to
 
-**Order DB (PostgreSQL)** — Order records, status, history
+**Portfolio Service** — Manages user holdings and P&L calculation; reads from Trade DB; updated when trades are confirmed
 
-**Trade DB (PostgreSQL)** — Executed trade records
+**Payment Service** — Handles fund addition and withdrawal; integrates with Payment Gateway; writes to Payment DB
 
-**Portfolio DB (PostgreSQL)** — User holdings, cash balance
+**Notification Service** — Kafka consumer; sends order confirmation, trade execution alerts, price alerts via push/email
 
-**Market Data Store (Redis + Time-Series DB)** — Latest prices in Redis; historical ticks in InfluxDB
+**Order DB (PostgreSQL)** — Order records, status, history; `order_id, user_id, stock_id, order_type, price, quantity, trade_id, status`
 
-**Order Queue (Kafka)** — Orders published here; Matching Engine consumes
+**Trade DB (PostgreSQL)** — Executed trade records; read by Portfolio Service for P&L calculation
 
-**Redis** — Latest stock prices, user session, order status cache
+**User DB (PostgreSQL)** — User profiles, KYC data (encrypted PAN, bank details, portfolio metadata)
+
+**Watch DB** — User watchlist mappings (userId → symbols)
+
+**Payment DB (PostgreSQL)** — Payment records, fund transfers; `payment_id, user_id, transaction_id, amount, currency, timestamp, metadata`
+
+**InfluxDB** — Historical price ticks per symbol; time-series optimized; used for charts and past price queries
+
+**Redis Pub/Sub** — Price Ingester publishes price updates per symbol; Price Tracker Service instances subscribe; fan-out to all connected WebSocket clients watching that symbol
+
+**Kafka** — Two logical streams:
+- Order flow: `raw_orders` → Validator → `verified_orders` / `rejected_orders` → Order Tracker
+- Market data: Exchange Gateway → `stock_price`, `order_status` → Price Ingester, Notification Service
 
 ## 4. Database Design
 
@@ -92,11 +104,11 @@ Portfolio records   = 10M users × 100 holdings × 200B = 200GB
 
 | Store | Why |
 |---|---|
-| PostgreSQL (Orders/Trades) | ACID for financial records; relational queries for history |
-| PostgreSQL (Portfolio) | ACID for balance/holdings updates; row-level locking |
-| Redis | Latest stock prices (sub-ms reads), order status cache, sessions |
-| InfluxDB | Historical price ticks — time-series, efficient range queries |
-| Kafka | Order queue, trade events, market data distribution |
+| PostgreSQL (Order/Trade DB) | ACID for financial records; relational queries for history |
+| PostgreSQL (User/Payment DB) | Structured user + KYC data, ACID, encrypted sensitive fields |
+| InfluxDB | Historical price ticks — time-series, efficient range queries for charts |
+| Redis Pub/Sub | Sub-ms price fan-out to WebSocket clients; publish once per symbol, deliver to all subscribers |
+| Kafka | Durable order pipeline (raw → verified → exchange) and market data stream |
 
 ### PostgreSQL — orders
 
@@ -104,15 +116,13 @@ Portfolio records   = 10M users × 100 holdings × 200B = 200GB
 |---|---|
 | order_id | UUID (PK) |
 | user_id | UUID |
-| stock_symbol | VARCHAR |
+| stock_id | UUID |
 | order_type | ENUM (market / limit) |
 | side | ENUM (buy / sell) |
 | quantity | INT |
-| price | DECIMAL, nullable (null for market orders) |
-| status | ENUM (pending / open / partially_filled / filled / cancelled / rejected) |
-| filled_quantity | INT |
-| avg_fill_price | DECIMAL, nullable |
-| idempotency_key | VARCHAR, unique |
+| price | DECIMAL, nullable |
+| trade_id | UUID, nullable |
+| status | ENUM (pending / verified / rejected / open / partially_filled / filled / cancelled) |
 | placed_at | TIMESTAMP |
 | updated_at | TIMESTAMP |
 
@@ -123,39 +133,45 @@ Portfolio records   = 10M users × 100 holdings × 200B = 200GB
 | trade_id | UUID (PK) |
 | buy_order_id | UUID |
 | sell_order_id | UUID |
-| stock_symbol | VARCHAR |
+| stock_id | UUID |
 | quantity | INT |
 | price | DECIMAL |
 | buyer_id | UUID |
 | seller_id | UUID |
 | executed_at | TIMESTAMP |
 
-### PostgreSQL — portfolio
-
-| Field | Type |
-|---|---|
-| user_id | UUID |
-| stock_symbol | VARCHAR |
-| quantity | INT |
-| avg_buy_price | DECIMAL |
-| updated_at | TIMESTAMP |
-
-### PostgreSQL — accounts
+### PostgreSQL — users
 
 | Field | Type |
 |---|---|
 | user_id | UUID (PK) |
-| cash_balance | DECIMAL |
-| reserved_cash | DECIMAL (held for open buy orders) |
-| updated_at | TIMESTAMP |
+| email | VARCHAR, unique |
+| phone | VARCHAR |
+| password_hash | VARCHAR |
+| pan_card | VARCHAR (encrypted) |
+| bank_details | JSONB (encrypted) |
+| portfolio | JSONB (encrypted metadata) |
+| kyc_status | ENUM (pending / verified / rejected) |
+| created_at | TIMESTAMP |
+
+### PostgreSQL — payments
+
+| Field | Type |
+|---|---|
+| payment_id | UUID (PK) |
+| user_id | UUID |
+| transaction_id | VARCHAR |
+| amount | DECIMAL |
+| currency | VARCHAR |
+| status | ENUM (pending / success / failed) |
+| timestamp | TIMESTAMP |
+| metadata | JSONB |
 
 ### Redis Keys
 
 | Key Pattern | Type | Value | TTL |
 |---|---|---|---|
-| `price:{symbol}` | String | latest price + timestamp | — (updated on each tick) |
-| `orderbook:{symbol}:bids` | ZSET | price → quantity | — |
-| `orderbook:{symbol}:asks` | ZSET | price → quantity | — |
+| `price:{symbol}` | Pub/Sub channel | latest price tick JSON | — |
 | `order:status:{orderId}` | String | status JSON | 3600s |
 | `session:{sessionId}` | String | userId | 86400s |
 
@@ -163,169 +179,159 @@ Portfolio records   = 10M users × 100 holdings × 200B = 200GB
 
 ### 5.1 Auth & Account Setup
 
-1. User registers → KYC verification (identity + bank account linking)
-2. On KYC approval: account created with initial cash balance
+1. User registers → User Service → KYC verification (PAN, bank account, identity)
+2. On KYC approval: account activated, encrypted KYC data stored in User DB
 3. Login → JWT (1hr) + session in Redis
-4. API Gateway validates JWT on every request
+4. API Gateway validates JWT on every HTTP request; WebSocket Gateway validates on connect
 
-### 5.2 Order Placement
+### 5.2 Order Placement & Validation
 
 ```
-Client → Order Service
-              ↓
-    Validate: market hours, valid symbol, valid quantity
-              ↓
-    Risk Service: sufficient funds? position limits? circuit breaker?
-              ↓
-    Reserve funds (for buy orders): accounts.reserved_cash += order_value
-              ↓
-    Write order to PostgreSQL (status=pending)
-              ↓
-    Publish to Kafka order queue (partitioned by stock_symbol)
-              ↓
-    Return orderId (202 Accepted)
+Client → API Gateway → Order Service
+                            ↓
+              Write to Order DB (status=pending)
+              Publish to Kafka: raw_orders
+                            ↓
+                        Validator
+              (funds check, position limits, KYC, circuit breaker)
+                            ↓
+              verified_orders → Order Tracker → Exchange Gateway → NSE/BSE
+              rejected_orders → Order DB (status=rejected) → Notification
 ```
 
-1. User places order: `{symbol: AAPL, side: buy, type: limit, qty: 10, price: 150}`
-2. Order Service validates: market is open, symbol exists, quantity > 0
-3. Risk Service checks:
-   - Sufficient cash: `cash_balance - reserved_cash >= qty × price`
-   - Position limit: user doesn't exceed max position in one stock
-   - Circuit breaker: stock not halted
-4. Reserve funds: `reserved_cash += qty × price` (prevents double-spending on concurrent orders)
-5. Write order to PostgreSQL with `status = pending`
-6. Publish to Kafka, partition key = `stock_symbol` (all orders for same stock → same partition → same Matching Engine)
-7. Return `orderId` immediately
+1. User places order: `{stockId, side: buy, type: limit, qty: 10, price: 150}`
+2. Order Service validates format, writes to Order DB (`status = pending`), publishes to `raw_orders`
+3. Validator consumes `raw_orders`:
+   - KYC verified?
+   - Sufficient funds: `cash_balance - reserved >= qty × price`
+   - Position limit not exceeded
+   - Stock not circuit-breaker halted
+   - Time & session validity
+4. Valid → publish to `verified_orders`; invalid → publish to `rejected_orders`, update Order DB, notify user
+5. Order Tracker consumes `verified_orders` → calls Exchange Gateway → places order on NSE/BSE
+6. Exchange acknowledges → Order Tracker updates `status = open` in Order DB
+7. Reserve funds for buy orders on validation success
 
-### 5.3 Order Matching Engine
+### 5.3 Order Matching (Exchange Side)
 
-The most critical component. Single-threaded per stock for strict price-time priority.
+The actual matching happens at NSE/BSE, not in our system. The exchange runs its own order book with price-time priority. Our system:
+- Sends orders to exchange via Exchange Gateway
+- Receives fill notifications back (fully filled, partially filled, rejected)
+- Order Tracker processes these status updates, writes to Order DB and Trade DB
+- Publishes `order_status` events to Kafka → Notification Service
 
-**Order Book structure:**
+**For interview context — if asked about internal matching engine:**
+If building a proprietary exchange (not a broker), the matching engine is in-memory, single-threaded per symbol, with Kafka partitioned by symbol. See order book structure in concepts section.
+
+### 5.4 Real-Time Price Updates
+
 ```
-Bids (buy orders) — sorted by price DESC, then time ASC:
-  150.00 → [order1 (100 shares, 9:30:01), order2 (50 shares, 9:30:05)]
-  149.50 → [order3 (200 shares, 9:30:02)]
-
-Asks (sell orders) — sorted by price ASC, then time ASC:
-  150.50 → [order4 (75 shares, 9:30:03)]
-  151.00 → [order5 (100 shares, 9:30:04)]
+NSE/BSE → Exchange Gateway (400–500 symbols/ws)
+                ↓
+         Price Ingester Service
+                ↓              ↓
+           InfluxDB        Kafka: stock_price
+                                ↓
+                         Redis Pub/Sub (publish per symbol)
+                                ↓
+                    Price Tracker Service (WebSocket Server)
+                                ↓
+                    Connected clients subscribed to that symbol
 ```
 
-**Matching algorithm:**
-```
-New buy order arrives at price 150.50:
-  Best ask = 150.50 (order4, 75 shares)
-  150.50 <= 150.50 → MATCH
-  Trade: 75 shares at 150.50
-  order4 fully filled, removed from book
-  New buy order partially filled (75/100 shares)
-  Remaining 25 shares added to bid side at 150.50
-```
+1. Exchange Gateway maintains WebSocket connections to NSE/BSE (400–500 symbols per connection)
+2. Price Ingester consumes ticks: writes to InfluxDB (historical), publishes to Redis Pub/Sub channel `price:{symbol}`
+3. Price Tracker Service instances subscribe to Redis Pub/Sub channels for symbols their connected users watch
+4. On price update: push to all WebSocket clients subscribed to that symbol
+5. User subscribes to symbol via WatchList Service → Price Tracker starts subscribing to that Redis channel
 
-**Flow:**
-1. Matching Engine consumes order from Kafka
-2. For market order: match against best available price immediately
-3. For limit order: check if crossing price exists in book
-4. If match: create trade event, update order quantities
-5. If no match (limit order): add to order book
-6. Publish trade event to Kafka → Trade Service
-7. Publish order book update → Market Data Service
+### 5.5 Portfolio & P&L
 
-**Why single-threaded per stock:**
-Matching requires strict ordering — two concurrent matches for the same stock could create inconsistencies. Single-threaded eliminates locking overhead and ensures deterministic price-time priority.
-
-### 5.4 Trade Execution
-
-1. Trade Service consumes trade event from Kafka
-2. PostgreSQL transaction:
-   - Insert trade record
-   - Update buyer's order: `filled_quantity += trade_qty`, `avg_fill_price = weighted avg`
-   - Update seller's order similarly
-   - Update buyer's portfolio: `holdings += trade_qty`
-   - Update seller's portfolio: `holdings -= trade_qty`
-   - Update buyer's account: `reserved_cash -= trade_value`, `cash_balance -= trade_value`
-   - Update seller's account: `cash_balance += trade_value`
-3. Publish `TRADE_EXECUTED` to Kafka → Notification Service
-
-### 5.5 Market Data Distribution
-
-1. Exchange feed sends price ticks to Market Data Service
-2. Market Data Service updates Redis: `SET price:{symbol} {price, volume, timestamp}`
-3. Broadcasts to all WebSocket subscribers for that symbol
-4. Stores tick to InfluxDB for historical queries
-5. Client receives real-time price updates via WebSocket
-
-**Fan-out challenge:** 1M users watching 10 stocks each = 10M subscriptions. Solution: Redis Pub/Sub per symbol — Market Data Service publishes once per symbol, all WebSocket servers subscribed to that symbol deliver to their connected clients.
+1. Trade confirmed → Trade DB updated
+2. Portfolio Service reads Trade DB to compute holdings and average buy price
+3. P&L = (current price from Redis/InfluxDB - avg buy price) × quantity
+4. Portfolio page reads current prices from InfluxDB (past price) or Redis Pub/Sub (live)
 
 ### 5.6 Order Cancellation
 
 1. User cancels order → Order Service
-2. Verify order belongs to user and is cancellable (`status = open or pending`)
-3. Publish cancel request to Kafka (same partition as original order)
-4. Matching Engine processes cancel: removes from order book
-5. Order Service updates `status = cancelled`
-6. Release reserved funds: `reserved_cash -= remaining_qty × price`
+2. Verify order is cancellable (`status = open`)
+3. Order Tracker sends cancel request to Exchange Gateway → exchange
+4. Exchange confirms cancel → Order Tracker updates `status = cancelled`
+5. Release reserved funds
 
 ## 6. Key Interview Concepts
 
-### Order Book Data Structure
-Order book is an in-memory data structure:
-- Bids: max-heap (or sorted map) by price — best bid at top
-- Asks: min-heap (or sorted map) by price — best ask at top
-- Within same price: FIFO queue (time priority)
+### Exchange Gateway — The Critical Boundary
+In a broker system (Zerodha, Robinhood), you don't run your own matching engine — the exchange (NSE/BSE) does. The Exchange Gateway is the adapter between your system and the exchange:
+- Maintains persistent WebSocket/FIX connections to the exchange
+- Handles 400–500 symbols per WebSocket connection
+- Translates internal order format to exchange protocol
+- Receives live price feeds and order fill notifications
+- Single point of exchange connectivity — all other services go through it
 
-For fast matching: use a sorted map (TreeMap/SortedDict) keyed by price, value = queue of orders at that price. Match in O(log N) for price lookup + O(1) for FIFO dequeue.
+### Validator as a Separate Service
+Separating validation from Order Service keeps Order Service fast (just write + publish). Validator does the expensive checks (DB reads for balance, KYC status, position limits) asynchronously. Kafka topics make the separation clean:
+- `raw_orders` → Validator → `verified_orders` / `rejected_orders`
+- Rejected orders never reach the exchange
+
+### Redis Pub/Sub for Price Fan-out
+1M users watching 10 stocks = 10M subscriptions. Naive approach: update 10M Redis keys on each tick. Better: Redis Pub/Sub — Price Ingester publishes once to `price:{symbol}` channel; all Price Tracker Service instances subscribed to that channel deliver to their connected WebSocket clients. Publish once, fan-out to all.
+
+### Order Book Data Structure (for proprietary exchange)
+If asked about building the matching engine itself:
+- Bids: sorted map (price DESC) → FIFO queue per price level
+- Asks: sorted map (price ASC) → FIFO queue per price level
+- Match: O(log N) price lookup + O(1) FIFO dequeue
+- Single-threaded per symbol — eliminates locking, ensures price-time priority
 
 ### Price-Time Priority
-Two orders at the same price: the one placed earlier gets filled first. This is the standard fairness rule in all exchanges. Enforced by the FIFO queue within each price level.
+Two orders at the same price: earlier order fills first. Enforced by FIFO queue within each price level. Standard fairness rule across all exchanges.
 
 ### Market vs Limit Orders
-- Market order: execute immediately at best available price; always fills (unless no liquidity)
-- Limit order: execute only at specified price or better; may not fill immediately; sits in order book
-
-### Why Single-Threaded Matching Engine
-Concurrent matching for the same stock creates race conditions:
-- Two buy orders both match against the same sell order → oversell
-- Locking is expensive and complex
-- Single-threaded eliminates all concurrency issues
-- Kafka partitioning by symbol ensures all orders for a stock go to the same engine instance
+- Market order: fill immediately at best available price
+- Limit order: fill only at specified price or better; sits in order book if no match
 
 ### Circuit Breakers
-If a stock price moves >10% in 5 minutes, trading is halted (circuit breaker). Matching Engine stops accepting orders for that stock. Prevents flash crashes. Implemented as a flag per symbol checked before matching.
+Stock price moves >10% in 5 minutes → trading halted. Validator checks circuit breaker flag before forwarding to exchange. Prevents flash crashes. Flag set by a monitoring service watching price movements.
 
 ### Fund Reservation
-When a buy order is placed, funds are reserved immediately (`reserved_cash += order_value`). This prevents a user from placing 10 orders worth $10K each with only $10K in their account. On fill: reserved → actual deduction. On cancel: reserved released.
+On order validation: reserve `qty × price` from user's balance. Prevents placing 10 orders with only enough funds for 1. On fill: reserved → actual deduction. On cancel/reject: reserved released.
 
 ### T+2 Settlement
-Trade execution is immediate (T+0). Actual transfer of shares and cash happens T+2 (2 business days later). This is a regulatory requirement. Settlement Service handles the actual transfer asynchronously.
+Trade execution is immediate (T+0). Actual share and cash transfer happens T+2 (regulatory requirement). Settlement Service handles the deferred transfer asynchronously.
 
-### Idempotency
-Network retry could place the same order twice. Solution: `idempotency_key = hash(userId + symbol + side + qty + price + timestamp_bucket)`. Unique constraint in PostgreSQL prevents duplicate orders.
+### InfluxDB for Historical Prices
+Price ticks are time-series data — InfluxDB is purpose-built for this. Efficient range queries: "give me AAPL prices for the last 1 hour" is a simple time-range query. Used for charts on the portfolio and stock detail pages.
 
 ## 7. Failure Scenarios
 
-### Matching Engine Crash
-- Detection: health check fails; Kafka consumer stops
-- Recovery: restart Matching Engine; rebuild order book from PostgreSQL (open orders) + Kafka (unprocessed messages); resume matching
-- Prevention: persist order book state to Redis periodically; warm restart from snapshot
+### Exchange Gateway Disconnection
+- Detection: WebSocket connection to NSE/BSE drops
+- Recovery: reconnect immediately with exponential backoff; buffer outgoing orders locally; replay on reconnect
+- Prevention: multiple WebSocket connections to exchange; heartbeat monitoring
 
-### Duplicate Order (Kafka Redelivery)
-- Scenario: Matching Engine processes order, crashes before committing Kafka offset → redelivery
-- Recovery: idempotency key on order; Matching Engine checks if order already in book or filled before processing
-- Prevention: idempotent order processing
+### Validator Crash
+- Detection: Kafka consumer lag on `raw_orders` grows; orders stuck in pending
+- Recovery: another Validator instance picks up from Kafka; idempotent validation (same order → same result)
+- Prevention: multiple Validator instances in consumer group
+
+### Order Tracker Crash Mid-Placement
+- Detection: order placed on exchange but status not updated in DB
+- Recovery: on restart, query exchange for status of all open orders; reconcile with Order DB
+- Prevention: exchange provides order status API for reconciliation; idempotent status updates
+
+### Price Feed Failure
+- Impact: stale prices shown to users; order placement unaffected (exchange handles pricing)
+- Recovery: reconnect to exchange feed; Redis Pub/Sub retains last published price; users see "delayed data" warning
+- Prevention: multiple feed connections; fallback to exchange REST API for last price
 
 ### Fund Reservation Race Condition
-- Scenario: two concurrent orders both pass the fund check before either reserves
-- Recovery: PostgreSQL `UPDATE accounts SET reserved_cash = reserved_cash + ? WHERE cash_balance - reserved_cash >= ?` — atomic check-and-update; one fails if insufficient funds
-- Prevention: row-level lock on account during reservation
+- Scenario: two concurrent orders both pass the balance check before either reserves
+- Recovery: atomic DB update: `UPDATE accounts SET reserved = reserved + ? WHERE balance - reserved >= ?` — one fails
+- Prevention: row-level lock on account during reservation check
 
-### Market Data Feed Failure
-- Impact: stale prices shown to users; order placement unaffected (uses order book prices)
-- Recovery: reconnect to exchange feed; Redis retains last known prices; users see "delayed data" warning
-- Prevention: multiple feed connections; failover to backup feed provider
-
-### PostgreSQL Failure (Trade DB)
-- Impact: trade records not persisted; Kafka trade events not acknowledged
-- Recovery: promote replica; Trade Service retries from Kafka; idempotency prevents duplicate trade records
+### PostgreSQL Failure (Order DB)
+- Impact: order writes fail; Kafka messages not acknowledged; orders not lost
+- Recovery: promote replica; Order Service retries; idempotency key prevents duplicate orders
 - Prevention: synchronous replication; automated failover

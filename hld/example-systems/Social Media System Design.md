@@ -62,37 +62,47 @@ Trending topics     = small, easily cached
 
 **API Gateway** — Auth, rate limiting, routing
 
-**User Service** — Registration, login, profile management, follow graph
+**User Service** — Registration, login, profile management; writes to User DB
 
-**Post Service** — Post creation, deletion, media upload; writes to Post DB; publishes to Kafka
+**Content Service** — Post creation and deletion; validates content; publishes to Kafka `raw_post` topic; does not write to DB directly (async pipeline handles that)
 
-**Feed Service** — Generates and serves personalized home feed; reads from Feed Cache or builds on demand
+**Moderator Service** — Kafka consumer on `raw_post`; runs content moderation (spam detection, hate speech, NSFW classifiers); publishes to `filtered_post` (approved) or `blocked_post` (rejected); keeps post creation fast by doing moderation async
 
-**Fan-out Service** — Kafka consumer; distributes new posts to followers' feed caches (push model)
+**Post Consumer Service** — Kafka consumer on `filtered_post`; writes approved posts to Post DB and media to S3; triggers search indexing and notification for mentions
 
-**Timeline Service** — Serves user's own posts (profile page); reads from Post DB
+**Feed Service** — Serves personalized home feed; reads from Feed Cache (Redis) first, falls back to Feed DB, then pull-based reconstruction
 
-**Engagement Service** — Likes, comments, shares, retweets; writes to Engagement DB; Kafka events for counters
+**Fan-out Service** — Kafka consumer; fetches follower list from Follower Cache (Redis) → Follower DB; pushes postId to followers' Feed Cache and Feed DB (hybrid push/pull)
+
+**Follower Service** — Manages follow/unfollow relationships; writes to Follower DB; invalidates Follower Cache on change
+
+**Engagement Service** — Likes (with reaction types), comments, shares; writes to Engagement DB; Kafka events for counter updates and notifications
 
 **Search Service** — User and post search; Elasticsearch; CDC from Post DB
 
 **Notification Service** — Kafka consumer; real-time push notifications via WebSocket + FCM/APNs
 
-**Trending Service** — Computes trending hashtags and topics from engagement events; Redis ZSET
+**Trending Service** — Computes trending hashtags from engagement events; Redis ZSET
 
-**Media Service** — Handles image/video upload; stores to S3; triggers encoding for videos; returns CDN URLs
+**Media Service** — Handles image/video upload; stores to S3; returns CDN URLs
 
-**Post DB (Cassandra)** — Posts, partitioned by userId; high read/write throughput
+**Post DB (Cassandra)** — Approved post records, partitioned by userId
 
-**User DB (MySQL)** — User profiles, follow relationships
+**User DB (MySQL)** — User profiles, credentials
 
-**Engagement DB (Cassandra)** — Likes, comments — high write throughput, time-series
+**Follower DB (PostgreSQL)** — Follow relationships; separate from User DB due to different access patterns (graph traversal, high write volume)
 
-**Feed Cache (Redis)** — Pre-computed feeds per user (top 200 posts)
+**Engagement DB (Cassandra)** — Likes (with reaction_type), comments — high write throughput
+
+**Feed Cache (Redis)** — Pre-computed feeds per user (top 200 postIds); primary read path
+
+**Feed DB (Cassandra)** — Durable backing store for feeds; survives Redis eviction; Feed Cache rebuilt from here on miss
+
+**Follower Cache (Redis)** — Cached top follower lists per user; used by Fan-out Service to avoid hitting Follower DB on every post
 
 **S3 + CDN** — Media storage and delivery
 
-**Kafka** — Post events, engagement events, notification fan-out
+**Kafka** — Three post topics: `raw_post`, `filtered_post`, `blocked_post`; plus engagement events, notification fan-out
 
 ## 4. Database Design
 
@@ -101,27 +111,28 @@ Trending topics     = small, easily cached
 | Store | Why |
 |---|---|
 | Cassandra (Post DB) | High write throughput, partition by userId, time-series ordering |
-| MySQL (User DB) | Structured user data, follow graph, ACID |
-| Cassandra (Engagement) | Billions of likes/comments, append-only |
-| Redis | Feed cache, trending topics, sessions |
+| MySQL (User DB) | Structured user data, ACID |
+| PostgreSQL (Follower DB) | Follow graph — relational queries, ACID, separate from user data due to scale |
+| Cassandra (Engagement DB) | Billions of likes/comments, append-only, high throughput |
+| Cassandra (Feed DB) | Durable feed storage, partition by userId, survives Redis eviction |
+| Redis | Feed Cache, Follower Cache, trending topics, sessions |
 | Elasticsearch | Full-text search on posts and users |
 | S3 + CDN | Media storage, global delivery |
 
 ### Cassandra — posts
 
-Partition key: `user_id`, Clustering: `post_id DESC` (TIMEUUID)
-
 | Field | Type |
 |---|---|
 | user_id | UUID (partition key) |
 | post_id | TIMEUUID (clustering) |
-| content | TEXT |
-| media_urls | LIST\<TEXT\> |
+| post_type | VARCHAR (text / image / video) |
+| content_text | TEXT |
+| media_url | TEXT |
+| thumbnail_url | TEXT |
 | like_count | COUNTER |
-| comment_count | COUNTER |
 | share_count | COUNTER |
-| hashtags | LIST\<VARCHAR\> |
-| created_at | TIMESTAMP |
+| comment_count | COUNTER |
+| metadata | JSONB |
 
 ### MySQL — users
 
@@ -137,16 +148,28 @@ Partition key: `user_id`, Clustering: `post_id DESC` (TIMEUUID)
 | following_count | INT |
 | created_at | TIMESTAMP |
 
-### MySQL — follows
+### PostgreSQL — followers
 
 | Field | Type |
 |---|---|
+| follow_id | UUID (PK) |
 | follower_id | UUID |
-| followee_id | UUID |
-| created_at | TIMESTAMP |
-| PRIMARY KEY | (follower_id, followee_id) |
+| following_id | UUID |
+| status | ENUM (active / blocked) |
+| timestamp | TIMESTAMP |
+| metadata | JSONB |
 
-### Cassandra — comments
+### Cassandra — engagement (likes)
+
+| Field | Type |
+|---|---|
+| post_id | UUID (partition key) |
+| like_id | TIMEUUID (clustering) |
+| user_id | UUID |
+| reaction_type | VARCHAR (like / love / haha / angry / sad) |
+| metadata | JSONB |
+
+### Cassandra — engagement (comments)
 
 | Field | Type |
 |---|---|
@@ -154,13 +177,15 @@ Partition key: `user_id`, Clustering: `post_id DESC` (TIMEUUID)
 | comment_id | TIMEUUID (clustering) |
 | user_id | UUID |
 | content | TEXT |
-| created_at | TIMESTAMP |
+| like_count | COUNTER |
+| metadata | JSONB |
 
 ### Redis Keys
 
 | Key Pattern | Type | Value | TTL |
 |---|---|---|---|
 | `feed:{userId}` | List | ordered postIds (top 200) | 3600s |
+| `followers:{userId}` | List | top follower userIds | 300s |
 | `trending:hashtags` | ZSET | hashtag → score | 300s |
 | `post:meta:{postId}` | String | post JSON | 600s |
 | `session:{sessionId}` | String | userId | 86400s |
@@ -173,20 +198,28 @@ Partition key: `user_id`, Clustering: `post_id DESC` (TIMEUUID)
 2. Login → validate → JWT (1hr) + refresh token → session in Redis
 3. API Gateway validates JWT on every request
 
-### 5.2 Post Creation
+### 5.2 Post Creation & Moderation
 
-1. User creates post → Post Service
-2. Validate content (length, media count)
-3. If media: upload to S3 via Media Service, get CDN URLs
-4. Write post to Cassandra (partition by userId)
-5. Publish `POST_CREATED` event to Kafka
-6. Return postId to client
+```
+Client → Content Service → Kafka: raw_post
+                                      ↓
+                              Moderator Service
+                              (spam / NSFW / hate speech check)
+                                      ↓
+                    filtered_post          blocked_post
+                          ↓                     ↓
+                Post Consumer Svc         notify user (rejected)
+                (write PostDB + S3)
+                          ↓
+                  Kafka: post_created → Fan-out, Search, Notification
+```
 
-**Kafka consumers:**
-- Fan-out Service: push post to followers' feed caches
-- Search Service: index post in Elasticsearch
-- Trending Service: update hashtag counts
-- Notification Service: notify mentioned users
+1. User creates post → Content Service validates format, publishes to `raw_post`
+2. Returns postId immediately (async — post not yet live)
+3. Moderator Service consumes `raw_post`: runs ML classifiers (spam, NSFW, hate speech)
+4. Approved → publish to `filtered_post`; rejected → publish to `blocked_post`, notify user
+5. Post Consumer Service consumes `filtered_post`: writes to Post DB (Cassandra), media to S3
+6. Publishes `post_created` event → Fan-out Service, Search Service, Notification Service (for mentions)
 
 ### 5.3 Feed Generation — The Core Problem
 
@@ -215,14 +248,18 @@ Partition key: `user_id`, Clustering: `post_id DESC` (TIMEUUID)
 
 ### 5.4 Fan-out Service
 
-1. Consumes `POST_CREATED` from Kafka
-2. Fetches follower list from MySQL (paginated for large follower counts)
-3. For each follower (if < 1M followers threshold):
-   - `LPUSH feed:{followerId} {postId}`
+1. Consumes `post_created` from Kafka
+2. Fetches follower list from **Follower Cache** (Redis `followers:{userId}`) — avoids hitting Follower DB on every post
+3. Cache miss: query Follower DB, populate cache (TTL 5min)
+4. For each follower (if poster has < 1M followers — push model):
+   - `LPUSH feed:{followerId} {postId}` in Redis Feed Cache
    - `LTRIM feed:{followerId} 0 199` (keep top 200)
-4. Skip celebrities' followers (they pull on read)
+   - Write to Feed DB (Cassandra) for durability
+5. Skip fan-out for celebrities (> 1M followers) — their followers pull on read
+6. Batch Redis writes using pipeline; process follower batches in parallel
 
-**Optimization:** batch Redis writes using pipeline; process followers in parallel workers
+**Why Feed DB alongside Feed Cache:**
+Redis TTL evicts feeds for inactive users. Feed DB (Cassandra) is the durable backing store — Feed Cache rebuilt from Feed DB on miss, not from Post DB. Faster recovery, less load on Post DB.
 
 ### 5.5 Engagement (Likes, Comments)
 
@@ -263,16 +300,30 @@ Chronological feed is simple but not engaging. Ranked feed considers:
 - Content type preference (user watches more videos → videos ranked higher)
 
 ### Follow Graph Storage
-MySQL `follows` table with composite PK `(follower_id, followee_id)`. Two query patterns:
-- "Who does user A follow?" → `SELECT followee_id WHERE follower_id = A`
-- "Who follows user A?" → `SELECT follower_id WHERE followee_id = A`
-Both need indexes. For very large graphs (1B+ edges), consider graph DB (Neo4j) or denormalized Cassandra tables.
+Follower relationships are stored in a **separate PostgreSQL DB** (not in User DB). Reasons:
+- The follow graph is a completely different access pattern — high write volume, graph traversal queries
+- At 1B users × 200 follows = 200B edges, it dwarfs user profile data
+- Separating it lets both scale independently
+
+Two query patterns both need indexes:
+- "Who does user A follow?" → `SELECT following_id WHERE follower_id = A`
+- "Who follows user A?" → `SELECT follower_id WHERE following_id = A`
+
+**Follower Cache** in Redis caches top follower lists per user (TTL 5min). Fan-out Service reads from cache first — avoids a DB query on every post from a popular user.
 
 ### Counter Accuracy
 500M likes/day = 5.8K likes/sec. Writing to Cassandra COUNTER on every like creates hot partitions for viral posts. Solution: buffer in Redis (`INCR post:likes:{postId}`), batch-flush to Cassandra every 30s. Slight staleness acceptable.
 
-### Soft Delete
-Posts are never hard-deleted immediately. Mark as `deleted = true`, hide from feeds. Async job purges after 30 days. Allows recovery from accidental deletion and compliance with legal holds.
+### Content Moderation Pipeline
+At scale, you can't moderate synchronously — it would add 500ms+ to every post. Async pipeline via Kafka:
+- Post creation returns immediately with `postId`
+- Moderator Service runs ML classifiers in the background
+- Approved posts go live within seconds; rejected posts never reach Post DB
+- Three Kafka topics keep the flows clean: `raw_post` → `filtered_post` / `blocked_post`
+- Moderator Service scales independently based on post volume
+
+### Reaction Types
+Modern platforms have reaction types beyond just "like" (love, haha, angry, sad). Stored as `reaction_type` in the Engagement DB. Enables richer analytics ("this post got 10K angry reactions") and different notification copy ("X reacted 😂 to your post").
 
 ### CAP Trade-off
 Social media favors Availability + Partition tolerance (AP). A user seeing a post 2 seconds late is fine. A user unable to post is not. Cassandra with eventual consistency is the right choice for posts and engagement.

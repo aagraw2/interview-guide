@@ -1,7 +1,7 @@
 # Google Drive System Design
 
 ## System Overview
-A cloud file storage and sync service (think Google Drive / Dropbox / OneDrive) where users upload, store, organize, and share files — with real-time sync across devices, collaborative access, and version history.
+A cloud file storage and sync service (think Google Drive / Dropbox / OneDrive) where users upload, store, organize, and share files — with chunked parallel uploads, real-time sync across devices, collaborative access, and version history.
 
 ## Architecture Diagram
 #### (To be inserted)
@@ -15,7 +15,6 @@ A cloud file storage and sync service (think Google Drive / Dropbox / OneDrive) 
 - Share files/folders with other users (view / edit permissions)
 - Version history — restore previous versions
 - Search files by name and content
-- Real-time collaboration on supported file types (Docs, Sheets)
 - Offline access with sync on reconnect
 
 ### Non-Functional Requirements
@@ -51,62 +50,86 @@ With dedup (30%)    = 35TB/day net new
 With 3× replication = 105TB/day
 ```
 
-## 3. Core Components
+## 3. Client-Side Architecture
 
-**API Gateway** — Auth, rate limiting, routing
+The desktop/mobile client has four internal components that work together:
 
-**Metadata Service** — File and folder metadata CRUD; permissions; version records; writes to Metadata DB
+**Watcher** — monitors the local file system for changes (new files, modifications, deletions); triggers the upload pipeline on change
 
-**Upload Service** — Handles file uploads; chunking for large files; deduplication; stores chunks to S3; updates Metadata Service
+**Local Metadata Index** — local DB of file state (name, size, last modified, chunk hashes); used to detect what changed and avoid re-uploading unchanged chunks
 
-**Download Service** — Serves file downloads; validates permissions; returns CDN URLs or streams from S3
+**Chunker** — splits files into fixed-size chunks (configurable, e.g., 5MB); computes SHA256 of each chunk; enables parallel upload and delta sync
 
-**Sync Service** — Manages device sync state; detects changes; pushes delta updates to connected devices via WebSocket/long-poll
+**Upload Manager** — manages the upload state machine; tracks which chunks are uploaded; handles retries; calls File Uploader Service APIs
 
-**Share Service** — Manages sharing permissions; generates share links; access control
+**Sync Engine** — handles bidirectional sync:
+- Pull: on reconnect, fetches changes since last sync cursor from server
+- Push (Fanout): receives server-side change notifications and applies locally
 
-**Search Service** — File name and content search; Elasticsearch; CDC from Metadata DB
+## 4. Core Server Components
 
-**Version Service** — Manages file version history; stores version metadata; retrieves previous versions
+**LB + API Gateway** — Auth, rate limiting, routing
 
-**Notification Service** — Notifies users of shared file changes, comments, access requests
+**User Onboarding Service** — Registration, login, JWT issuance; writes to User DB
 
-**Metadata DB (MySQL/PostgreSQL)** — File/folder hierarchy, permissions, version records
+**File Uploader Service** — Orchestrates the multi-step upload protocol; validates permissions; generates pre-signed S3 URLs per chunk; on commit, calls File Metadata Service and publishes to Kafka
 
-**Chunk Store (S3)** — Actual file data stored as content-addressed chunks
+**Validator Service** — Validates upload permissions before generating signed URLs; checks quota, file type restrictions, ownership
+
+**File Metadata Service** — Stores and manages file/folder metadata, versions, chunk mappings; writes to MetaDB; publishes change events to Kafka for Sync Service
+
+**Read/Download Service** — Handles file download requests; validates permissions; generates pre-signed S3 URLs for download; serves via CDN for public/cached files
+
+**Sync Service** — Consumes Kafka file change events; pushes delta updates to connected devices (WebSocket/long-poll); handles pull requests from reconnecting devices using sync cursor
+
+**Share Service** — Manages sharing permissions; generates share link tokens; access control
+
+**Search Service** — File name and content search; Elasticsearch; CDC from MetaDB
+
+**S3** — Stores actual chunk data; content-addressed by chunk hash (`s3://bucket/{chunkHash}`)
 
 **CDN** — Caches frequently downloaded files at edge
 
-**Redis** — Active sync sessions, upload state, permission cache, session store
+**MetaDB (PostgreSQL)** — All file/folder metadata, versions, chunk mappings, permissions
 
-**Kafka** — File change events, sync notifications, search indexing
+**Redis** — Upload state (uploadId → chunkId bitmap + retry count), sync cursors, permission cache, session store
 
-## 4. Database Design
+**Kafka** — File change events for Sync Service and Search indexing
+
+## 5. Database Design
 
 ### Selection Reasoning
 
 | Store | Why |
 |---|---|
-| PostgreSQL (Metadata DB) | File hierarchy (adjacency list), permissions, versions — ACID, relational |
-| S3 (Chunk Store) | Exabyte-scale file storage, 11 nines durability, CDN integration |
-| Redis | Upload state (resumable), sync session state, permission cache |
+| PostgreSQL (MetaDB) | File hierarchy, permissions, versions, chunk mappings — ACID, relational |
+| S3 | Exabyte-scale chunk storage, 11 nines durability, CDN integration |
+| Redis | Upload state (chunk bitmap), sync cursors, permission cache |
 | Elasticsearch | Full-text search on file names and content |
+
+### PostgreSQL — folders
+
+| Field | Type |
+|---|---|
+| folder_id | UUID (PK) |
+| parent_folder_id | UUID, nullable (null = root) |
+| owner_id | UUID |
+| name | VARCHAR |
+| created_at | TIMESTAMP |
+| metadata | JSONB |
 
 ### PostgreSQL — files
 
 | Field | Type |
 |---|---|
 | file_id | UUID (PK) |
+| parent_folder_id | UUID (FK → folders) |
 | owner_id | UUID |
-| parent_folder_id | UUID, nullable (null = root) |
 | name | VARCHAR |
 | size_bytes | BIGINT |
-| mime_type | VARCHAR |
-| content_hash | VARCHAR (SHA-256, for dedup) |
 | current_version_id | UUID |
 | is_deleted | BOOLEAN |
-| created_at | TIMESTAMP |
-| updated_at | TIMESTAMP |
+| metadata | JSONB |
 
 ### PostgreSQL — file_versions
 
@@ -114,168 +137,238 @@ With 3× replication = 105TB/day
 |---|---|
 | version_id | UUID (PK) |
 | file_id | UUID (FK → files) |
-| version_number | INT |
 | size_bytes | BIGINT |
-| content_hash | VARCHAR |
-| s3_key | TEXT (location in S3) |
 | created_by | UUID |
+| created_at | TIMESTAMP |
+
+### PostgreSQL — file_version_chunks
+Links a file version to its ordered list of chunks
+
+| Field | Type |
+|---|---|
+| version_id | UUID (FK → file_versions) |
+| chunk_index | INT (ordering of chunks) |
+| chunk_id | UUID (FK → chunks) |
+
+### PostgreSQL — chunks
+Content-addressed; one row per unique chunk (deduplication at chunk level)
+
+| Field | Type |
+|---|---|
+| chunk_id | UUID (PK) |
+| object_key | TEXT (`s3://bucket/path`) |
+| size_bytes | INT |
+| checksum | VARCHAR (SHA256 — content hash) |
 | created_at | TIMESTAMP |
 
 ### PostgreSQL — permissions
 
 | Field | Type |
 |---|---|
-| resource_id | UUID (file_id or folder_id) |
+| permission_id | UUID (PK) |
 | resource_type | ENUM (file / folder) |
-| grantee_id | UUID, nullable |
-| share_link_token | VARCHAR, nullable |
-| access_level | ENUM (owner / editor / viewer) |
+| resource_id | UUID |
+| user_id | UUID |
+| role | ENUM (owner / editor / viewer) |
 | created_at | TIMESTAMP |
+| metadata | JSONB |
 
-### PostgreSQL — folders
+### PostgreSQL — users
 
 | Field | Type |
 |---|---|
-| folder_id | UUID (PK) |
-| owner_id | UUID |
-| parent_folder_id | UUID, nullable |
-| name | VARCHAR |
-| is_deleted | BOOLEAN |
-| created_at | TIMESTAMP |
+| user_id | UUID (PK) |
+| email | VARCHAR, unique |
+| password_hash | VARCHAR |
+| created_date | TIMESTAMP |
+| metadata | JSONB |
 
 ### Redis Keys
 
 | Key Pattern | Type | Value | TTL |
 |---|---|---|---|
-| `upload:state:{uploadId}` | String | `{chunks_uploaded, total_chunks}` | 86400s |
+| `upload:{uploadId}` | Hash | `{chunkId_bitmap, retry_count, total_chunks}` | 86400s |
 | `sync:cursor:{userId}:{deviceId}` | String | last sync timestamp | 30 days |
-| `perm:cache:{fileId}:{userId}` | String | access_level | 300s |
+| `perm:cache:{fileId}:{userId}` | String | role | 300s |
 | `session:{sessionId}` | String | userId | 86400s |
 
-## 5. Key Flows
+## 6. Key Flows
 
-### 5.1 Auth
+### 6.1 Auth
 
-1. User logs in → JWT (1hr) + refresh token → session in Redis
+1. User registers/logs in → User Onboarding Service → write to User DB → return JWT
 2. API Gateway validates JWT on every request
-3. Metadata Service checks permissions on every file operation
+3. File Metadata Service checks permissions on every file operation
 
-### 5.2 File Upload
+### 6.2 File Upload Protocol (6-Step)
 
-**Small file (<5MB, single-part):**
-1. Client `POST /upload` with file data
-2. Upload Service computes SHA-256 hash of file content
-3. Deduplication check: does `content_hash` already exist in S3?
-   - If yes: reuse existing S3 object (no re-upload) — just create new metadata record pointing to same chunk
-   - If no: upload to S3
-4. Metadata Service creates file record + version record
-5. Publish `FILE_CREATED` to Kafka → Search Service indexes, Sync Service notifies devices
+The upload is a multi-step protocol that enables parallel chunk uploads, resumability, and deduplication.
 
-**Large file (>5MB, chunked upload):**
-1. Client initiates: `POST /upload/init` → returns `uploadId`
-2. Client splits file into 5MB chunks, uploads each: `PUT /upload/{uploadId}/chunk/{n}`
-3. Upload Service stores each chunk to S3 with key `chunks/{contentHash}`
-4. Client completes: `POST /upload/{uploadId}/complete`
-5. Upload Service assembles manifest, creates file record
-6. Resumable: if upload interrupted, client resumes from last uploaded chunk (tracked in Redis)
+**Step 1 — Initiate Upload**
+```
+POST /files/upload/init
+{
+  fileName: "video.mp4",
+  fileSize: 52428800,
+  chunkSize: 5MB,
+  parentFolderId: "root121413",
+  existingChunks: []   // client sends known chunk hashes; server skips those
+}
+→ returns { uploadId: "U456", fileId: "F123" }
+```
 
-### 5.3 File Download
+**Step 2 — Client Chunks the File**
+- Chunker splits file into N chunks of `chunkSize`
+- Computes SHA256 of each chunk: `[sha0, sha1, ..., sha9]`
+- Chunks with matching hash in `existingChunks` response are skipped (dedup)
+
+**Step 3 — Request Signed URL per Chunk**
+```
+POST /upload/chunk-url
+{
+  uploadId: "U456",
+  chunkId: 3,
+  chunkHash: "xyz23"
+}
+→ Validator checks upload permission
+→ returns { signedUrl: "https://s3...." }
+```
+
+**Step 4 — Upload Chunks Directly to S3 (Parallel, 3 at a time)**
+- Client uploads each chunk directly to S3 using the pre-signed URL
+- Bypasses app servers — reduces load and latency
+- Parallel uploads (3 concurrent) for speed
+- Redis tracks progress: `upload:{uploadId}` bitmap marks completed chunks
+- On failure: retry individual chunk using same signed URL (idempotent)
+
+**Step 5 — Commit Upload**
+```
+POST /uploads/{uploadId}/commit
+```
+
+**Step 6 — File Uploader calls File Metadata Service**
+- File Metadata Service saves all metadata to MetaDB:
+  - Creates `file_versions` record
+  - Creates `file_version_chunks` records (chunk_index → chunk_id)
+  - Creates/updates `chunks` records (chunk_id → S3 object_key)
+  - Updates `files.current_version_id`
+- Publishes `FILE_CREATED` / `FILE_UPDATED` event to Kafka
+- Sync Service consumes → notifies other devices
+
+### 6.3 File Download
 
 1. Client `GET /files/{fileId}/download`
-2. Download Service validates permission (Redis cache → PostgreSQL)
-3. Fetch `s3_key` from Metadata DB
-4. Return pre-signed S3 URL (valid 1hr) or CDN URL for public files
-5. Client downloads directly from S3/CDN
+2. Read/Download Service validates permission (Redis cache → MetaDB)
+3. Fetches `file_versions` → `file_version_chunks` → `chunks` to get all S3 object_keys in order
+4. Returns pre-signed S3 URLs per chunk (or CDN URL for public files)
+5. Client downloads chunks in parallel, reassembles in order
 
-### 5.4 File Sync Across Devices
+### 6.4 File Sync Across Devices
 
-**Change detection:**
-1. User modifies file on Device A → Upload Service processes new version
-2. Publishes `FILE_UPDATED` event to Kafka with `{fileId, userId, newVersionId, timestamp}`
-3. Sync Service consumes event
-4. Checks which of user's devices are connected (Redis `sync:cursor:{userId}:{deviceId}`)
-5. Pushes delta notification to connected devices via WebSocket
-6. Offline devices: delta queued; delivered on reconnect
+**Push (server → client):**
+1. File Metadata Service publishes `FILE_UPDATED` to Kafka
+2. Sync Service consumes, checks which devices are connected for that user
+3. Pushes delta notification via WebSocket: `{fileId, newVersionId, changedChunks}`
+4. Client Sync Engine receives, triggers download of changed chunks only
 
-**Device sync on reconnect:**
-1. Device connects, sends `sync:cursor` (last sync timestamp)
-2. Sync Service queries Metadata DB for all changes since cursor
-3. Returns list of changed files (added, modified, deleted)
-4. Device downloads changed files
-5. Updates cursor to current timestamp
+**Pull (client reconnects):**
+1. Client sends last sync cursor (timestamp) to Sync Service
+2. Sync Service queries MetaDB for all changes since cursor
+3. Returns list of changed files with version info
+4. Client downloads only changed chunks (delta sync)
+5. Updates local cursor
 
 **Conflict resolution:**
-- Both devices modify same file while offline
+- Both devices modify same file offline
 - On sync: detect conflict (both have newer version than last sync)
 - Create conflict copy: `filename (Device A's copy).ext`
 - User manually resolves
-- Same approach as Dropbox
 
-### 5.5 Sharing
+### 6.5 Delta Sync (Chunk-Level)
 
-1. User shares file → Share Service
-2. Write permission record to PostgreSQL
-3. Generate share link token (if link sharing): `HMAC(fileId + accessLevel + expiry)`
-4. Send email notification to recipient
-5. Recipient accesses file: Share Service validates token → grants access
+When a file is modified, only changed chunks need to be re-uploaded:
+1. Watcher detects file change
+2. Chunker re-chunks the file, computes SHA256 per chunk
+3. Compares with Local Metadata Index (previous chunk hashes)
+4. Only chunks with different hashes are uploaded
+5. Server creates new `file_version` with updated `file_version_chunks` (reuses unchanged chunk_ids)
+
+Example: 100MB file, user edits 1MB in the middle → only 1 chunk re-uploaded instead of 20.
+
+### 6.6 Sharing
+
+1. User shares file → Share Service writes to `permissions` table
+2. For link sharing: generate `share_link_token = HMAC(fileId + role + expiry)`
+3. Send email notification to recipient
+4. On access: validate token → grant access
 
 **Inherited permissions:**
 - Sharing a folder grants access to all files inside
-- Permission check: walk up folder hierarchy until permission found
-- Cache permission results in Redis (TTL 5min)
+- Permission check: check file's direct permissions first; if none, check parent folder; walk up to root
+- Cache results in Redis (TTL 5min)
 
-### 5.6 Version History
+### 6.7 Version History
 
-1. Every file upload creates a new version record
-2. Previous version's S3 object retained (not deleted)
-3. User views history: `GET /files/{fileId}/versions` → list of versions with timestamps
-4. User restores version V: Upload Service creates new version with V's content_hash
-5. Old versions deleted after retention period (e.g., 30 days for free tier, unlimited for paid)
+1. Every upload commit creates a new `file_versions` record
+2. Previous version's chunks retained in S3 (not deleted)
+3. User views history → list of versions with timestamps
+4. User restores version V: create new version pointing to V's `file_version_chunks`
+5. Old versions purged after retention period (30 days free, unlimited paid)
 
-### 5.7 Deduplication
+## 7. Key Interview Concepts
 
-Content-addressed storage: S3 key = `chunks/{SHA256_hash}`. If two users upload the same file, only one copy stored in S3. Both users' metadata records point to the same S3 object. Saves significant storage (common files: PDFs, images, videos).
+### Chunked Upload Protocol
+The 6-step protocol (init → chunk → signed URL → parallel S3 upload → commit → metadata) is the core design. Key benefits:
+- Resumable: Redis bitmap tracks completed chunks; resume from last successful chunk on failure
+- Parallel: 3 concurrent chunk uploads saturate available bandwidth
+- Dedup: client sends existing chunk hashes on init; server skips already-stored chunks
+- Direct S3 upload: bypasses app servers, reduces load
 
-## 6. Key Interview Concepts
+### Separate Chunks Table (Content-Addressed Storage)
+Chunks stored by SHA256 hash in S3 (`s3://bucket/{chunkHash}`). MetaDB has a `chunks` table with `object_key`. Benefits:
+- Deduplication at chunk level: two files sharing a 5MB chunk store it once
+- Integrity: re-hash on download, compare to stored checksum
+- Delta sync: unchanged chunks reused across versions without re-upload
 
-### Content-Addressed Storage
-Files stored by their content hash (SHA-256), not by name. Same content = same key = one copy in S3. Benefits:
-- Deduplication: 30–50% storage savings
-- Integrity verification: re-hash on download, compare to stored hash
-- Efficient sync: if hash unchanged, file unchanged — no re-upload needed
+### file_version_chunks as the Link Table
+`file_version_chunks` maps `(version_id, chunk_index) → chunk_id`. This is what enables:
+- Ordered chunk reassembly on download
+- Delta sync: new version reuses unchanged chunk_ids, only adds new ones
+- Storage efficiency: multiple versions share chunks
 
-### Chunked Upload for Large Files
-5GB file as single upload: network interruption = restart from scratch. Chunked upload: each 5MB chunk uploaded independently. On interruption: resume from last successful chunk. Also enables parallel chunk upload (faster for large files).
-
-### Delta Sync
-Instead of re-uploading entire file on change, sync only changed chunks. Client computes rolling hash of file chunks, compares with server's chunk hashes, uploads only changed chunks. Rsync algorithm. Reduces bandwidth significantly for large files with small changes.
-
-### Folder Hierarchy in DB
-Adjacency list model: each file/folder has `parent_folder_id`. Simple, works for most queries. For deep hierarchy traversal (find all files in folder tree): use recursive CTE in PostgreSQL or materialized path pattern.
-
-### Permission Inheritance
-Sharing a folder shares all contents. Permission check: check file's direct permissions first; if none, check parent folder; walk up to root. Cache results in Redis to avoid repeated hierarchy traversal.
+### Client-Side Components
+- Watcher detects changes → triggers upload pipeline
+- Chunker splits + hashes → enables dedup and delta
+- Upload Manager tracks state → enables resumability
+- Sync Engine handles pull/push → keeps devices in sync
+- Local Metadata Index stores chunk hashes → enables delta detection without re-reading file
 
 ### Sync Cursor
-Each device maintains a cursor (timestamp of last sync). On reconnect: "give me all changes since my cursor." Server returns delta. Efficient — no need to compare full file lists. Cursor stored in Redis (per user per device).
+Each device maintains a cursor (timestamp of last sync). On reconnect: "give me all changes since my cursor." Server returns delta. No need to compare full file lists. Cursor stored in Redis (per user per device).
 
-## 7. Failure Scenarios
+### Permission Inheritance
+Sharing a folder shares all contents. Permission check walks up the folder hierarchy. Cached in Redis (TTL 5min) to avoid repeated traversal. On permission change: actively invalidate cache.
 
-### Upload Service Crash Mid-Upload
-- Recovery: resumable upload — client retries from last successful chunk; Redis tracks upload state; idempotent chunk upload (same chunk hash = same S3 object)
-- Prevention: upload state persisted to Redis before each chunk ACK
+### Pre-signed S3 URLs
+Client uploads directly to S3 using time-limited pre-signed URLs. App servers never handle file bytes — only metadata and URL generation. Scales to any upload volume without app server bottleneck.
+
+## 8. Failure Scenarios
+
+### Upload Interrupted Mid-Chunk
+- Recovery: client retries individual chunk using same signed URL (idempotent — same chunk hash = same S3 object); Redis bitmap shows which chunks completed; resume from there
+- Prevention: Upload Manager persists state locally; Redis tracks server-side state
 
 ### S3 Region Outage
 - Impact: uploads and downloads fail
-- Recovery: cross-region replication; CDN serves cached files; uploads queued and retried
-- Prevention: multi-region S3 replication; CDN absorbs most download traffic
+- Recovery: cross-region S3 replication; CDN serves cached files; uploads queued and retried
+- Prevention: multi-region S3; CDN absorbs most download traffic
 
 ### Sync Conflict
 - Scenario: two devices modify same file offline
 - Recovery: conflict copy created; user notified; manual resolution
 - Prevention: last-write-wins for non-conflicting changes; conflict detection via version comparison
 
-### Metadata DB Failure
+### MetaDB Failure
 - Impact: file operations fail; downloads via CDN still work (cached)
 - Recovery: promote replica (<30s); Kafka events retained; operations retry after recovery
 - Prevention: synchronous replication; automated failover
@@ -284,3 +377,8 @@ Each device maintains a cursor (timestamp of last sync). On reconnect: "give me 
 - Scenario: user's access revoked but Redis cache still shows access
 - Recovery: short TTL (5min) limits window; on permission change, actively invalidate cache
 - Prevention: cache invalidation on permission change; TTL as safety net
+
+### Chunk Dedup Collision (SHA256)
+- Scenario: two different files produce same SHA256 (extremely unlikely but theoretically possible)
+- Recovery: use SHA256 + file size as composite key; collision probability negligible in practice
+- Prevention: SHA256 collision resistance is sufficient for this use case
