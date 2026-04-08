@@ -3,9 +3,6 @@
 ## System Overview
 A digital wallet platform (think PayTM / Google Pay / Apple Pay) that allows users to store money, send/receive peer-to-peer payments, pay merchants, and view transaction history — with strong consistency on balances and idempotent transactions.
 
-## Architecture Diagram
-#### (To be inserted)
-
 ## 1. Requirements
 
 ### Functional Requirements
@@ -48,35 +45,133 @@ Transactions    = 10M/day × 500B = 5GB/day → ~1.8TB/year
 Ledger entries  = 2 entries per txn × 10M/day × 300B = 6GB/day (double-entry)
 ```
 
-## 3. Core Components
+## 3. Architecture Diagram
 
-**API Gateway** — Auth, rate limiting, routing, 2FA enforcement for large transfers
+### Components
 
-**User Service** — Registration, KYC verification, profile management
+| Component | Role |
+|---|---|
+| API Gateway | Auth, rate limiting, routing, 2FA enforcement for large transfers |
+| User Service | Registration, KYC verification, profile management |
+| Wallet Service | Balance management; reads/writes to Wallet DB |
+| Transaction Service | Orchestrates P2P transfers; ensures atomicity; writes to Transaction DB and Ledger |
+| Payment Gateway Service | Integrates with banks/card networks for add money and withdrawal |
+| Fraud Detection Service | Real-time transaction scoring; blocks suspicious transactions |
+| Ledger Service | Double-entry bookkeeping; immutable audit trail |
+| Notification Service | Kafka consumer; sends SMS/push/email for every transaction |
+| Wallet DB (PostgreSQL) | User balances; ACID critical |
+| Transaction DB (PostgreSQL) | Transaction records with status |
+| Ledger DB (PostgreSQL) | Immutable double-entry ledger |
+| Redis | Balance cache, idempotency keys, session store, rate limiting |
+| Kafka | Async event bus for notifications, fraud detection, analytics |
 
-**Wallet Service** — Balance management; the core service; reads/writes to Wallet DB
+### Overview
 
-**Transaction Service** — Orchestrates P2P transfers and merchant payments; ensures atomicity; writes to Transaction DB and Ledger
+```mermaid
+flowchart LR
+    client["Client"]
+    apigw["API Gateway<br/>auth · rate limit · 2FA"]
 
-**Payment Gateway Service** — Integrates with banks/card networks for add money and withdrawal
+    userSvc["User Service<br/>KYC · profile"]
+    walletSvc["Wallet Service<br/>balance management"]
+    txnSvc["Transaction Service<br/>P2P orchestration"]
+    payGw["Payment Gateway Svc<br/>bank / card integration"]
+    fraud["Fraud Detection Svc<br/>real-time scoring"]
+    ledger["Ledger Service<br/>double-entry"]
+    notif["Notification Service"]
 
-**Fraud Detection Service** — Real-time transaction scoring; blocks suspicious transactions
+    walletDB[("Wallet DB<br/>PostgreSQL")]
+    txnDB[("Transaction DB<br/>PostgreSQL")]
+    ledgerDB[("Ledger DB<br/>PostgreSQL")]
+    redis[("Redis<br/>balance cache · idempotency")]
+    kafka[("Kafka")]
 
-**Notification Service** — Kafka consumer; sends SMS/push/email for every transaction
+    client --> apigw
+    apigw --> userSvc
+    apigw --> walletSvc
+    apigw --> txnSvc
 
-**Ledger Service** — Double-entry bookkeeping; every debit has a corresponding credit; immutable audit trail
+    walletSvc --> walletDB
+    walletSvc --> redis
 
-**Wallet DB (PostgreSQL)** — User balances; ACID critical
+    txnSvc --> fraud
+    txnSvc --> walletDB
+    txnSvc --> txnDB
+    txnSvc --> ledger
+    txnSvc --> redis
+    txnSvc -->|"events"| kafka
 
-**Transaction DB (PostgreSQL)** — Transaction records with status
+    ledger --> ledgerDB
+    payGw --> walletDB
 
-**Ledger DB (PostgreSQL)** — Immutable double-entry ledger
+    kafka --> notif
+    kafka --> fraud
+```
 
-**Redis** — Balance cache, session store, idempotency key store, rate limiting
+## 4. Key Flows
 
-**Kafka** — Async event bus for notifications, fraud detection, analytics
+### 4.1 P2P Transfer
 
-## 4. Database Design
+```mermaid
+flowchart LR
+    sender["Sender"] -->|"POST /transfer"| apigw["API Gateway"]
+    apigw --> txnSvc["Transaction Service"]
+    txnSvc -->|"idempotency check"| redis[("Redis")]
+    txnSvc --> fraud["Fraud Detection Svc<br/>sync · <100ms"]
+    txnSvc -->|"SELECT FOR UPDATE<br/>debit sender<br/>credit receiver<br/>write txn + ledger"| walletDB[("Wallet DB<br/>PostgreSQL")]
+    txnSvc -->|"invalidate balance cache"| redis
+    txnSvc -->|"TXN_SUCCESS"| kafka[("Kafka")]
+    kafka --> notif["Notification Service<br/>SMS / push"]
+```
+
+1. Sender initiates with `idempotency_key = hash(senderId + receiverId + amount + timestamp_bucket)`
+2. Check Redis for existing key — if exists, return cached result (no double processing)
+3. Fraud Detection scores transaction synchronously (<100ms)
+4. PostgreSQL transaction:
+   - `SELECT FOR UPDATE` on sender's wallet (row-level lock)
+   - Check balance >= amount; if not, rollback
+   - Debit sender, credit receiver atomically
+   - Write transaction record + two ledger entries
+   - Commit
+5. Store idempotency key in Redis (TTL 24hr) → invalidate balance cache
+6. Publish to Kafka → Notification Service sends SMS/push to both parties
+
+### 4.2 Add Money (Bank → Wallet)
+
+```mermaid
+flowchart LR
+    client["Client"] -->|"add money"| payGw["Payment Gateway Svc"]
+    payGw -->|"call bank / card network"| bank["Bank / Card Network"]
+    bank -->|"success"| payGw
+    payGw -->|"credit wallet"| walletDB[("Wallet DB<br/>PostgreSQL")]
+    payGw -->|"write ledger entry"| ledgerDB[("Ledger DB")]
+    payGw -->|"notify"| kafka[("Kafka")]
+```
+
+1. User initiates add money → Payment Gateway Service calls bank/card network
+2. On success: credit wallet balance in PostgreSQL + write ledger entry
+3. On failure: no balance change; notify user
+
+### 4.3 Withdrawal (Wallet → Bank)
+
+```mermaid
+flowchart LR
+    client["Client"] -->|"withdraw"| txnSvc["Transaction Service"]
+    txnSvc -->|"debit wallet (hold)"| walletDB[("Wallet DB")]
+    txnSvc --> payGw["Payment Gateway Svc"]
+    payGw -->|"bank transfer"| bank["Bank"]
+    bank -->|"success"| payGw
+    payGw -->|"confirm debit + ledger"| ledgerDB[("Ledger DB")]
+    bank -->|"failure"| payGw
+    payGw -->|"reverse debit"| walletDB
+```
+
+1. Debit wallet balance (hold amount)
+2. Call Payment Gateway to initiate bank transfer
+3. On success: confirm debit, write ledger
+4. On failure: reverse debit (credit back), notify user
+
+## 5. Database Design
 
 ### Selection Reasoning
 
@@ -135,63 +230,10 @@ Ledger entries  = 2 entries per txn × 10M/day × 300B = 6GB/day (double-entry)
 | `session:{sessionId}` | String | userId | 86400s |
 | `rate:{userId}` | Counter | txn count | 60s window |
 
-## 5. Key Flows
-
-### 5.1 P2P Transfer Flow
-
-```
-Sender → Transaction Service
-              ↓
-    Check idempotency key (Redis)
-              ↓
-    Fraud Detection Service (sync, <100ms)
-              ↓
-    PostgreSQL transaction:
-      SELECT balance FROM wallets WHERE user_id=sender FOR UPDATE
-      IF balance >= amount:
-        UPDATE wallets SET balance = balance - amount WHERE user_id=sender
-        UPDATE wallets SET balance = balance + amount WHERE user_id=receiver
-        INSERT INTO transactions (status=success)
-        INSERT INTO ledger (debit entry for sender, credit entry for receiver)
-      COMMIT
-              ↓
-    Invalidate Redis balance cache for both users
-              ↓
-    Publish TXN_SUCCESS to Kafka → Notification Service
-```
-
-1. Sender initiates transfer with `idempotency_key = hash(senderId + receiverId + amount + timestamp_bucket)`
-2. Transaction Service checks Redis for existing `idempotency:{key}` — if exists, return cached result (no double processing)
-3. Fraud Detection Service scores transaction in real-time (<100ms); block if high risk
-4. Begin PostgreSQL transaction:
-   - `SELECT FOR UPDATE` on sender's wallet row (row-level lock)
-   - Check balance >= amount; if not, rollback with "insufficient funds"
-   - Debit sender, credit receiver atomically
-   - Write transaction record and two ledger entries
-   - Commit
-5. Store `idempotency_key → txn_id` in Redis (TTL 24hr)
-6. Invalidate balance cache
-7. Publish to Kafka → Notification Service sends SMS/push to both parties
-
-### 5.2 Add Money (Bank → Wallet)
-
-1. User initiates add money → Payment Gateway Service
-2. Calls bank/card network API
-3. On success: credit wallet balance in PostgreSQL, write ledger entry
-4. On failure: no balance change; notify user
-
-### 5.3 Withdrawal (Wallet → Bank)
-
-1. User initiates withdrawal → Transaction Service
-2. Debit wallet balance (hold amount)
-3. Call Payment Gateway Service to initiate bank transfer
-4. On success: confirm debit, write ledger
-5. On failure: reverse debit (credit back), notify user
-
 ## 6. Key Interview Concepts
 
 ### Double-Entry Bookkeeping
-Every transaction creates two ledger entries: one debit and one credit. Sum of all entries for any wallet = current balance. This provides an immutable audit trail and enables reconciliation.
+Every transaction creates two ledger entries: one debit and one credit. Sum of all entries for any wallet = current balance. Provides an immutable audit trail and enables reconciliation.
 ```
 P2P: Alice sends $50 to Bob
   Ledger entry 1: DEBIT  Alice  $50  (balance: $150 → $100)
@@ -202,13 +244,13 @@ P2P: Alice sends $50 to Bob
 `SELECT FOR UPDATE` acquires a row-level lock on the sender's wallet row. Only one transaction can modify the balance at a time. Combined with balance check inside the transaction, negative balances are impossible.
 
 ### Idempotency
-Network retries can cause duplicate transactions. Solution: client generates `idempotency_key` before the first attempt. Server checks Redis — if key exists, return the original result without re-processing. Key stored with 24hr TTL.
+Client generates `idempotency_key` before the first attempt. Server checks Redis — if key exists, return the original result without re-processing. Key stored with 24hr TTL.
 
 ### Consistency vs Availability
 Wallet favors strong consistency (CP). A user seeing a slightly stale balance is acceptable (Redis cache, 60s TTL). But a double debit is never acceptable. PostgreSQL ACID transactions are the source of truth.
 
 ### Fraud Detection
-Real-time scoring on every transaction: velocity checks (too many transactions in short time), unusual amount, new device, geo anomaly. Synchronous check (<100ms) in the critical path. High-risk transactions blocked; medium-risk flagged for review.
+Real-time scoring on every transaction: velocity checks, unusual amount, new device, geo anomaly. Synchronous check (<100ms) in the critical path. High-risk transactions blocked; medium-risk flagged for review.
 
 ## 7. Failure Scenarios
 

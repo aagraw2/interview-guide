@@ -3,9 +3,6 @@
 ## System Overview
 A hotel booking platform (think Booking.com / Airbnb) where users search hotels by location and dates, check room availability, make reservations with payment, and leave reviews — with strong consistency on room availability to prevent double-booking.
 
-## Architecture Diagram
-#### (To be inserted)
-
 ## 1. Requirements
 
 ### Functional Requirements
@@ -34,118 +31,193 @@ A hotel booking platform (think Booking.com / Airbnb) where users search hotels 
 - 1M hotels, avg 100 rooms each = 100M rooms
 - Read:Write ratio = 1000:1 (search/browse >> book)
 - Peak: holiday season, 10× normal booking traffic
-- Average booking: 3 nights, $150/night
 
 ### Traffic
 ```
-Search requests/sec   = 50M × 10 searches/day / 86400 ≈ 5.8K/sec
+Search requests/sec   = 50M × 10 / 86400 ≈ 5.8K/sec
 Peak search/sec       ≈ 58K/sec (holiday season)
 
 Bookings/sec (avg)    = 500K / 86400 ≈ 6/sec
 Bookings/sec (peak)   = 5M / 86400 ≈ 58/sec
-
-Availability checks   = 5.8K × 5 rooms avg = 29K/sec
 ```
 
 ### Storage
 ```
-Hotels          = 1M × 5KB avg = 5GB
-Rooms           = 100M × 500B = 50GB
+Hotels          = 1M × 5KB = 5GB
 Availability    = 100M rooms × 365 days × 50B = 1.8TB/year
 Bookings/day    = 500K × 2KB = 1GB/day → ~365GB/year
-Reviews         = 1M hotels × 50 reviews × 500B = 25GB
 Images          = 1M hotels × 20 images × 500KB = 10TB → S3 + CDN
 ```
 
-### Memory (Cache)
+## 3. Architecture Diagram
+
+### Components
+
+| Component | Role |
+|---|---|
+| LB + API Gateway | Auth, rate limiting, routing |
+| User Service | Registration, login, JWT; writes to User DB (MySQL) |
+| Search Service | Hotel discovery by location, dates, price, rating via Elasticsearch |
+| Booking Service | Core transactional service; Redis lock + DB reservation + payment |
+| Room Availability Service | Manages availability per date range; called by Booking Service |
+| Payment Service | Gateway integration, idempotent transactions, refunds |
+| Review Service | Hotel reviews and ratings; async rating recalculation |
+| Notification Service | Kafka consumer; booking confirmations, cancellations, reminders |
+| Hotel DB (PostgreSQL) | Hotels, rooms, availability — ACID + PostGIS |
+| Booking DB (PostgreSQL) | Confirmed bookings and history |
+| Redis | Availability cache, booking lock (TTL 5min), session store |
+| Elasticsearch | Geo-distance + full-text hotel search |
+| S3 + CDN | Hotel and room images |
+| Kafka | Booking events, notifications, CDC |
+
+### Overview
+
+```mermaid
+flowchart LR
+    client["Client"]
+    apigw["LB & API Gateway"]
+
+    userSvc["User Service"]
+    searchSvc["Search Service"]
+    bookingSvc["Booking Service<br/>Redis lock + DB reservation"]
+    paymentSvc["Payment Service"]
+    reviewSvc["Review Service"]
+    notifSvc["Notification Service"]
+
+    hotelDB[("Hotel DB<br/>PostgreSQL + PostGIS")]
+    bookingDB[("Booking DB<br/>PostgreSQL")]
+    userDB[("User DB<br/>MySQL")]
+    redis[("Redis<br/>avail cache · booking lock")]
+    elastic[("Elasticsearch")]
+    kafka[("Kafka")]
+    s3cdn["S3 + CDN"]
+
+    client --> apigw
+    apigw --> userSvc
+    apigw --> searchSvc
+    apigw --> bookingSvc
+
+    userSvc --> userDB
+    searchSvc --> elastic
+    searchSvc --> redis
+    bookingSvc --> redis
+    bookingSvc --> hotelDB
+    bookingSvc --> bookingDB
+    bookingSvc --> paymentSvc
+    bookingSvc -->|"events"| kafka
+    paymentSvc --> bookingDB
+    reviewSvc --> hotelDB
+    reviewSvc -.->|"update avg_rating"| elastic
+    kafka --> notifSvc
+    hotelDB -.->|"CDC"| elastic
+    hotelDB --> s3cdn
 ```
-Hot hotel metadata    = top 100K hotels × 5KB = 500MB
-Availability cache    = 100M rooms × 50B = 5GB (hot: top 1M = 50MB)
-Sessions              = 50M × 500B = 25GB
-Redis locks           = active bookings × 100B ≈ negligible
+
+## 4. Key Flows
+
+### 4.1 Auth
+
+```mermaid
+flowchart LR
+    client["Client"] -->|"register / login"| apigw["API Gateway"]
+    apigw --> userSvc["User Service"]
+    userSvc --> userDB[("User DB<br/>MySQL")]
+    userSvc -->|"session"| redis[("Redis")]
+    userSvc -->|"JWT"| client
 ```
 
-## 3. Core Components
+Booking and payment endpoints require auth; search and hotel browse are public.
 
-**LB + API Gateway** — Authentication, authorization, routing, rate limiting, round-robin load balancing
+### 4.2 Hotel Search
 
-**User Service** — Registration, login, JWT issuance, profile management; reads/writes to User DB (MySQL)
+```mermaid
+flowchart LR
+    client["Client<br/>Paris · Dec 20-23 · $200"] --> searchSvc["Search Service"]
+    searchSvc -->|"geo-distance + filters"| elastic[("Elasticsearch")]
+    elastic -->|"ranked list"| client
+    client -->|"hotel detail"| redis[("Redis cache<br/>TTL 5min")]
+    redis -.->|"miss"| hotelDB[("Hotel DB")]
+    hotelDB -->|"images"| cdn["CDN"]
+```
 
-**Search Service** — Hotel discovery by location (geo), dates, price, rating, amenities; queries Elasticsearch; read-heavy, stateless
+Elasticsearch query: geo-distance + date availability + price range + full-text + sort by relevance/rating/price. CDC: Hotel DB → Kafka → Elasticsearch (eventual consistency).
 
-**Review Service** — Submit and fetch hotel reviews and ratings; writes to Review DB; async rating recalculation
+### 4.3 Booking Flow (Room Hold & Payment)
 
-**Booking Info Service** — Read-only service for fetching booking details and history; reads from Booking DB
+```mermaid
+flowchart LR
+    client["Client"] -->|"POST /booking"| bookingSvc["Booking Service"]
+    bookingSvc -->|"SET NX EX 300<br/>book:lock:{roomId}:{dates}"| redis[("Redis")]
+    bookingSvc -->|"SELECT FOR UPDATE<br/>verify + set BOOKED"| hotelDB[("Hotel DB<br/>availability")]
+    bookingSvc -->|"status=pending"| bookingDB[("Booking DB")]
+    bookingSvc --> paymentSvc["Payment Service"]
+    paymentSvc -->|"gateway"| gateway["Payment Gateway"]
+    gateway -->|"success"| paymentSvc
+    paymentSvc -->|"status=confirmed"| bookingDB
+    bookingSvc -->|"invalidate avail cache"| redis
+    bookingSvc -->|"BOOKING_CONFIRMED"| kafka[("Kafka")]
+    kafka --> notifSvc["Notification Service"]
+```
 
-**Booking Service** — Core transactional service; handles room hold (Redis lock), booking creation, payment orchestration, cancellation
+Two-gate approach:
+1. Redis `SET NX EX 300` — fast atomic gate, prevents two users reaching DB simultaneously
+2. PostgreSQL `SELECT FOR UPDATE` — durable correctness guarantee
 
-**Room Availability Service** — Manages room availability per date range; checks and updates Availability table in Hotel DB; called by Booking Service for reservation
+```
+User1: SET book:lock:room101:dec20:dec23 user1 NX EX 300 → OK
+User2: SET book:lock:room101:dec20:dec23 user2 NX EX 300 → NIL (blocked)
+```
 
-**Payment Service** — Payment gateway integration, idempotent transactions, refunds; writes to Payment DB
+On payment failure: revert `availability.status = AVL`, cancel booking, release lock.
 
-**Notification Service** — Kafka consumer; sends booking confirmations, cancellation alerts, reminders via email/push
+### 4.4 Booking Cancellation
 
-**Consumer** — Kafka consumer for general events (analytics, review aggregation, search index updates)
+```mermaid
+flowchart LR
+    client["Client"] -->|"DELETE /booking/{id}"| bookingSvc["Booking Service"]
+    bookingSvc -->|"status=cancelled<br/>availability=AVL"| bookingDB[("Booking DB")]
+    bookingSvc --> paymentSvc["Payment Service<br/>initiate refund"]
+    bookingSvc -->|"invalidate cache"| redis[("Redis")]
+    bookingSvc -->|"BOOKING_CANCELLED"| kafka[("Kafka")]
+```
 
-**Hotel DB (PostgreSQL)** — Hotels, rooms, pricing, and availability tables; ACID for availability updates
+### 4.5 Reviews
 
-**User DB (MySQL)** — User profiles, credentials, metadata
+```mermaid
+flowchart LR
+    client["Client"] -->|"submit review"| reviewSvc["Review Service"]
+    reviewSvc -->|"validate booking exists"| bookingDB[("Booking DB")]
+    reviewSvc -->|"write review"| hotelDB[("Hotel DB")]
+    reviewSvc -->|"async recalc avg_rating"| kafka[("Kafka")]
+    kafka -.->|"update Elasticsearch"| elastic[("Elasticsearch")]
+```
 
-**Review DB** — Hotel reviews, ratings, images
-
-**Booking DB** — Confirmed bookings and booking history
-
-**Payment DB** — Payment records, refunds
-
-**Redis Cache** — Hot hotel metadata, sessions, room availability cache, Redis lock for booking (TTL 5min)
-
-**Elasticsearch** — Full-text and geo search on hotels; synced from Hotel DB via CDC
-
-**S3** — Hotel images and room photos
-
-**Kafka** — Async event bus for booking events, notifications, CDC propagation
-
-## 4. Database Design
+## 5. Database Design
 
 ### Selection Reasoning
 
 | Store | Why |
 |---|---|
-| PostgreSQL (Hotel DB) | Hotels, rooms, availability — ACID for availability updates, row-level locking to prevent double-booking, geo queries via PostGIS |
-| MySQL (User DB) | Structured user data, ACID, relational |
-| PostgreSQL (Booking DB) | ACID transactions for booking creation, relational queries for history |
-| MySQL (Payment DB) | PCI-DSS compliance, ACID, audit trail |
-| Redis | Room availability cache, session store, booking lock (TTL 5min) |
-| Elasticsearch | Geo-distance search, full-text on hotel name/amenities, faceted filters |
-| S3 | Hotel and room images |
+| PostgreSQL (Hotel DB) | Hotels, rooms, availability — ACID, row-level locking, PostGIS for geo |
+| MySQL (User DB) | Structured user data, ACID |
+| PostgreSQL (Booking DB) | ACID transactions for booking creation |
+| Redis | Availability cache (TTL 60s), booking lock (TTL 5min), sessions |
+| Elasticsearch | Geo-distance search, full-text, faceted filters |
+| S3 + CDN | Hotel and room images |
 
-### PostgreSQL (Hotel DB) — hotels
+### PostgreSQL — hotels
 
 | Field | Type |
 |---|---|
 | hotel_id | UUID (PK) |
 | name | VARCHAR |
 | address | TEXT |
-| geo_location | POINT (lat/lng, PostGIS indexed) |
-| room_type | VARCHAR |
-| capacity | INT |
-| metadata | JSONB (amenities, policies) |
+| geo_location | POINT (PostGIS indexed) |
 | avg_rating | DECIMAL |
+| metadata | JSONB (amenities, policies) |
 | created_at | TIMESTAMP |
 
-### PostgreSQL (Hotel DB) — rooms
-
-| Field | Type |
-|---|---|
-| room_id | UUID (PK) |
-| hotel_id | UUID (FK → hotels) |
-| room_type | VARCHAR (single / double / suite) |
-| capacity | INT |
-| price | DECIMAL |
-| currency | VARCHAR |
-| metadata | JSONB |
-
-### PostgreSQL (Hotel DB) — availability
+### PostgreSQL — availability
 
 | Field | Type |
 |---|---|
@@ -155,17 +227,7 @@ Redis locks           = active bookings × 100B ≈ negligible
 | end_date | DATE |
 | status | ENUM (AVL / BOOKED / MAINTENANCE) |
 
-### MySQL (User DB) — users
-
-| Field | Type |
-|---|---|
-| user_id | UUID (PK) |
-| email | VARCHAR, unique |
-| password | VARCHAR (hashed) |
-| date | DATE (DOB) |
-| metadata | JSONB |
-
-### PostgreSQL (Booking DB) — bookings
+### PostgreSQL — bookings
 
 | Field | Type |
 |---|---|
@@ -181,259 +243,56 @@ Redis locks           = active bookings × 100B ≈ negligible
 | idempotency_key | VARCHAR, unique |
 | created_at | TIMESTAMP |
 
-### MySQL (Payment DB) — payments
-
-| Field | Type |
-|---|---|
-| payment_id | UUID (PK) |
-| user_id | UUID |
-| booking_id | UUID |
-| amount | DECIMAL |
-| currency | VARCHAR |
-| status | ENUM (pending / success / failed / refunded) |
-| date | TIMESTAMP |
-
-### Review DB — reviews
-
-| Field | Type |
-|---|---|
-| review_id | UUID (PK) |
-| hotel_id | UUID |
-| user_id | UUID |
-| rating | INT (1–5) |
-| comments | TEXT |
-| images | ARRAY\<TEXT\> (S3 URLs) |
-| created_at | TIMESTAMP |
-
 ### Redis Keys
 
 | Key Pattern | Type | Value | TTL |
 |---|---|---|---|
-| `session:{sessionId}` | String | `{userId}` | 86400s |
 | `hotel:meta:{hotelId}` | String | hotel metadata JSON | 300s |
 | `avail:{hotelId}:{date}` | String | available room count | 60s |
-| `book:lock:{roomId}:{checkIn}:{checkOut}` | String | userId (NX EX) | 300s (5min checkout window) |
-
-## 5. Key Flows
-
-### 5.1 Auth
-
-1. User registers → User Service → hash password → write to User DB (MySQL) → return JWT
-2. Login → validate credentials → generate JWT (1hr) + refresh token → store session in Redis
-3. Every request: API Gateway validates JWT + Redis session
-4. Booking and payment endpoints require auth; search and hotel browse are public
-
-### 5.2 Hotel Search
-
-```
-Client → API Gateway → Search Service → Elasticsearch
-                                              ↓
-                                  geo-filtered, ranked results
-                                              ↓
-                       Hotel metadata from Redis cache → PostgreSQL fallback
-                                              ↓
-                              Images served via CDN (S3)
-```
-
-1. User searches "hotels in Paris, Dec 20–23, 2 guests, under $200" → Search Service
-2. Elasticsearch query:
-   - Geo-distance filter: within X km of "Paris" coordinates
-   - Date availability filter (from availability cache or pre-indexed)
-   - Price range filter
-   - Full-text on hotel name, amenities
-   - Sort by relevance / rating / price
-3. Returns ranked hotel list with basic metadata
-4. Client selects hotel → fetch full details from Redis cache (TTL 5min) → fallback to PostgreSQL
-5. Room availability for selected dates fetched from Redis cache → fallback to Hotel DB
-
-**CDC Sync (Hotel DB → Elasticsearch):**
-- Hotel/room updates written to PostgreSQL → CDC captures change → Kafka → Elasticsearch consumer updates index
-- Eventual consistency — search index may lag a few seconds
-
-### 5.3 Room Availability Check
-
-1. Client requests availability for `{hotelId, checkIn, checkOut}`
-2. Booking Info Service checks Redis cache: `avail:{hotelId}:{date}` for each date in range
-3. Cache hit: return available room count and types
-4. Cache miss: query Hotel DB `availability` table for rooms with `status = AVL` in date range
-5. Populate Redis cache (TTL 60s)
-6. Return available rooms with pricing to client
-
-### 5.4 Booking Flow — Room Hold & Payment
-
-This is the critical flow — two users must not book the same room for overlapping dates.
-
-```
-Client → Booking Service
-              ↓
-    Acquire Redis lock: SET book:lock:{roomId}:{checkIn}:{checkOut} {userId} NX EX 300
-              ↓ (lock acquired)
-    Verify availability in Hotel DB (SELECT FOR UPDATE)
-              ↓
-    Update availability: status = BOOKED for date range
-              ↓
-    Create booking record (status = pending)
-              ↓
-    Call Payment Service → Payment Gateway
-              ↓
-    On success: booking.status = confirmed, publish to Kafka
-    On failure: release lock, revert availability, cancel booking
-```
-
-**Step by step:**
-1. User selects room and dates → `POST /booking`
-2. Booking Service attempts Redis lock: `SET book:lock:{roomId}:{checkIn}:{checkOut} {userId} NX EX 300`
-3. If lock exists (another user booking same room): return "room being booked, try again"
-4. Lock acquired → verify availability in PostgreSQL with `SELECT FOR UPDATE` on availability rows
-5. If available: update `availability.status = BOOKED` for the date range
-6. Create `booking` record with `status = pending` in Booking DB
-7. Call Payment Service with `{bookingId, amount, idempotencyKey}`
-8. Payment Service calls external gateway
-9. On payment success:
-   - Update `booking.status = confirmed`
-   - Write payment record to Payment DB
-   - Release Redis lock
-   - Invalidate availability cache: `DEL avail:{hotelId}:{date}` for affected dates
-   - Publish `BOOKING_CONFIRMED` to Kafka
-10. On payment failure:
-    - Revert `availability.status = AVL`
-    - Update `booking.status = cancelled`
-    - Release Redis lock
-    - Return error to client
-
-**Why Redis lock + DB transaction:**
-Redis `SET NX EX` is the fast first gate — prevents two users from even reaching the DB transaction simultaneously. PostgreSQL `SELECT FOR UPDATE` is the durable correctness guarantee. Together they handle both speed and safety.
-
-**Concurrency example:**
-```
-User1 and User2 both try to book Room 101, Dec 20–23:
-
-Redis: SET book:lock:room101:dec20:dec23 user1 NX EX 300 → OK (user1 wins)
-Redis: SET book:lock:room101:dec20:dec23 user2 NX EX 300 → NIL (user2 blocked)
-
-User2 gets "room is being booked" — retries after a moment
-If user1 completes: user2 sees "room unavailable"
-If user1 abandons: lock expires after 5min, user2 can try
-```
-
-### 5.5 Booking Cancellation & Refund
-
-**Before check-in:**
-1. User cancels → Booking Service
-2. Verify booking belongs to user and is `confirmed`
-3. Check cancellation policy (e.g., free cancellation >48hr before check-in)
-4. PostgreSQL transaction:
-   - `booking.status = cancelled`
-   - `availability.status = AVL` for the date range (room freed)
-5. Payment Service initiates refund via gateway
-6. Invalidate availability cache for affected dates
-7. Publish `BOOKING_CANCELLED` to Kafka → Notification Service sends confirmation
-
-### 5.6 Reviews & Ratings
-
-1. After check-out date passes, user submits review → Review Service
-2. Validate user had a confirmed booking for that hotel (check Booking DB)
-3. Write review to Review DB
-4. Async (Consumer via Kafka): recalculate `avg_rating` for hotel, update Hotel DB
-5. CDC propagates updated `avg_rating` to Elasticsearch (affects search ranking)
-6. Review images uploaded to S3, URLs stored in Review DB
-
-### 5.7 Notification Flow
-
-Kafka consumers handle all async notifications:
-- `BOOKING_CONFIRMED` → send booking confirmation email with details
-- `BOOKING_CANCELLED` → send cancellation + refund confirmation
-- Reminder 24hr before check-in → scheduled job publishes event to Kafka
-- Payment failure → alert user to update payment method
+| `book:lock:{roomId}:{checkIn}:{checkOut}` | String | userId (NX EX) | 300s |
+| `session:{sessionId}` | String | userId | 86400s |
 
 ## 6. Key Interview Concepts
 
-### Preventing Double Booking — The Core Problem
-Same as ticket booking but more complex — a room booking spans multiple dates, not a single seat. Two users booking the same room for overlapping date ranges must be prevented.
-
-Solution:
+### Preventing Double Booking
 1. Redis `SET NX EX` lock on `{roomId}:{checkIn}:{checkOut}` — fast atomic gate
 2. PostgreSQL `SELECT FOR UPDATE` on availability rows — durable correctness
-3. Availability table stores per-room per-date-range status — overlap check is a range query
-
-**Date range overlap check:**
-```
-Existing booking: Dec 20 – Dec 23
-New request:      Dec 22 – Dec 25  ← overlaps
-
-Overlap condition: newStart < existingEnd AND newEnd > existingStart
-```
-
-### Why PostgreSQL for Hotel DB
-Hotels, rooms, and availability have relational structure with foreign keys. Availability requires ACID transactions (update multiple date rows atomically). PostGIS extension enables efficient geo-distance queries for location-based search. Cassandra would be wrong here — no transactions, no row-level locking.
+3. Date range overlap check: `newStart < existingEnd AND newEnd > existingStart`
 
 ### Availability Table Design
-Storing availability as date ranges (start_date, end_date, status) is more efficient than one row per day. A 365-day availability for 100M rooms as daily rows = 36.5B rows. As date ranges, most rooms have just a few records (available, booked, maintenance periods).
-
-**Trade-off:** range queries are slightly more complex but storage is orders of magnitude smaller.
+Storing as date ranges (start_date, end_date, status) vs one row per day. 100M rooms × 365 days = 36.5B rows as daily records. As date ranges, most rooms have just a few records. Storage is orders of magnitude smaller.
 
 ### Redis Lock TTL (5 Minutes)
-5-minute checkout window gives users time to complete payment without holding the room indefinitely. If payment takes >5min (unlikely), lock expires and room becomes available again. The booking record in DB is also marked `expired` by a cleanup job. TTL is a business decision — balance between user experience and inventory availability.
+Gives users time to complete payment without holding the room indefinitely. If payment takes >5min, lock expires and room becomes available again. PostgreSQL is the ultimate correctness guarantee.
 
 ### CDC for Search Sync
-Hotel DB (PostgreSQL) → CDC (Debezium) → Kafka → Elasticsearch. Hotel updates (new rooms, price changes, rating updates) propagate to search index asynchronously. Eventual consistency — search may show slightly stale prices for a few seconds. Acceptable for browse; actual price confirmed at booking time.
+Hotel DB → Debezium → Kafka → Elasticsearch. Hotel updates propagate asynchronously. Slight staleness acceptable for browse; actual price confirmed at booking time.
 
-### Geo Search with Elasticsearch + PostGIS
-Elasticsearch `geo_distance` query filters hotels within X km of a point — fast, scalable, purpose-built for this. PostGIS on PostgreSQL is an alternative for more complex geo queries (polygon search, routing). For simple radius search, Elasticsearch is preferred since it also handles full-text and facets in the same query.
+### Saga Pattern
+`ROOM_HELD → PAYMENT_SUCCESS → confirm booking` / `PAYMENT_FAILED → release availability → cancel booking`. Compensating actions ensure no room permanently blocked by failed payment.
 
-### Read >> Write Architecture
-1000:1 read:write ratio. Search path (Elasticsearch + Redis cache) is completely separate from booking path (PostgreSQL transactions). CDN serves all images. Redis absorbs hot hotel metadata reads. PostgreSQL only sees transactional writes (bookings, availability updates).
+This is a **choreography-based saga**: Booking Service holds the room and publishes `ROOM_HELD`, Payment Service consumes it and charges the customer, then publishes `PAYMENT_SUCCESS` or `PAYMENT_FAILED`. Booking Service consumes the result and either confirms the booking (keeping availability as `BOOKED`) or releases the room back to `AVL` and cancels the booking.
 
-### Idempotency in Payments
-Payment gateway timeout → client retries → risk of double charge. Solution: `idempotency_key = hash(bookingId + userId)`. Gateway returns same response for duplicate keys. Unique constraint in Payment DB prevents duplicate records.
-
-### Saga Pattern for Booking + Availability + Payment
-Three operations must succeed together. If payment fails, availability must be released.
-```
-ROOM_HELD → initiate payment
-PAYMENT_SUCCESS → confirm booking, keep availability as BOOKED
-PAYMENT_FAILED → release availability back to AVL, cancel booking
-```
-Compensating actions ensure no room is permanently blocked by a failed payment.
+**Outbox pattern** applies here too: Booking Service writes the booking record and the `ROOM_HELD` event to an `outbox` table in the same PostgreSQL transaction. CDC publishes to Kafka. If Booking Service crashes after the DB write, the CDC poller ensures the event is still published — preventing the room from being silently held forever with no payment triggered.
 
 ## 7. Failure Scenarios
 
-### Double Booking Attempt (Race Condition)
-- Scenario: two users simultaneously book the same room for same dates
-- Prevention: Redis `SET NX EX` — only one acquires lock; PostgreSQL `SELECT FOR UPDATE` as safety net
-- If Redis is down: fall back to PostgreSQL `SELECT FOR UPDATE` only — slower but correct
+### Double Booking Race Condition
+- Prevention: Redis `SET NX EX` + PostgreSQL `SELECT FOR UPDATE`
+- If Redis is down: fall back to PostgreSQL `SELECT FOR UPDATE` only
 
-### Redis Lock Failure (Lock Lost Mid-Booking)
-- Scenario: Redis crashes after lock acquired but before booking completes
-- Recovery: Redis Sentinel failover (<30s); lock lost means another user could acquire it; PostgreSQL `SELECT FOR UPDATE` prevents actual double-booking at DB level; first user's transaction either commits or rolls back cleanly
+### Redis Lock Lost Mid-Booking
+- Recovery: PostgreSQL `SELECT FOR UPDATE` prevents actual double-booking at DB level
 - Prevention: Redis Cluster + AOF; PostgreSQL is the ultimate correctness guarantee
 
 ### Payment Gateway Timeout
-- Detection: no response within 5s
-- Recovery: retry with same `idempotency_key`; after 3 retries, release availability, cancel booking, notify user; async webhook callback as fallback
-- Prevention: idempotency key prevents double charge on retry
+- Recovery: retry with same `idempotency_key`; after 3 retries, release availability, cancel booking
+- Prevention: async webhook callback as fallback
 
-### PostgreSQL Primary Failure (Hotel DB)
-- Impact: availability checks and booking writes fail; search (Elasticsearch) continues working
-- Recovery: promote replica (<30s); Redis cache continues serving availability reads during failover; in-flight bookings with Redis locks retry after recovery
-- Prevention: synchronous replication for availability and bookings; automated failover
+### PostgreSQL Primary Failure
+- Impact: availability checks and booking writes fail; search continues working
+- Recovery: promote replica (<30s); Redis cache continues serving reads during failover
 
-### Availability Cache Stale (Redis)
-- Scenario: room booked but Redis cache not invalidated → search shows room as available
-- Recovery: user reaches booking step, DB check shows unavailable → "room no longer available" error; user searches again with fresh data
-- Prevention: always invalidate `avail:{hotelId}:{date}` cache on booking confirmation and cancellation; short TTL (60s) limits staleness window
-
-### Elasticsearch Failure
-- Impact: hotel search unavailable; booking for known hotels still works via direct hotel ID
-- Recovery: graceful degradation — fall back to PostgreSQL geo queries (slower, less rich); CDC replays missed changes on recovery
-- Prevention: Elasticsearch cluster with replicas; non-critical path — bookings unaffected
-
-### Booking Lock Expiry During Payment
-- Scenario: payment takes slightly longer than 5min TTL → lock expires → another user acquires lock
-- Recovery: second user's `SELECT FOR UPDATE` sees availability already `BOOKED` (first user's DB update committed) → correctly blocked; first user's booking completes normally
-- Prevention: payment timeout enforced client-side at 4min 30s; 5min TTL is generous for any real payment flow
-
-### Kafka Consumer Lag (Notification Service)
-- Impact: booking confirmation emails delayed
-- Recovery: Kafka retains events; Notification Service catches up; booking is confirmed in DB regardless
-- Prevention: monitor consumer lag; Notification Service is non-critical path — booking correctness unaffected
+### Availability Cache Stale
+- Recovery: user reaches booking step, DB check shows unavailable → "room no longer available"
+- Prevention: invalidate `avail:{hotelId}:{date}` on booking confirmation and cancellation; TTL 60s

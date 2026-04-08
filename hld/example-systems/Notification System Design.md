@@ -3,9 +3,6 @@
 ## System Overview
 A scalable notification delivery system that sends push notifications, emails, and SMS to users across multiple channels — handling high throughput, user preferences, deduplication, retry logic, and delivery tracking. Used as an internal platform service by other systems (order updates, chat messages, marketing campaigns).
 
-## Architecture Diagram
-#### (To be inserted)
-
 ## 1. Requirements
 
 ### Functional Requirements
@@ -30,18 +27,15 @@ A scalable notification delivery system that sends push notifications, emails, a
 
 ### Assumptions
 - 1B users
-- 10M transactional notifications/day (order updates, alerts)
-- 100M marketing notifications/day (campaigns, promotions)
+- 10M transactional + 100M marketing notifications/day
 - Channel split: 60% push, 30% email, 10% SMS
-- Retry rate: 5% of notifications fail first attempt
 
 ### Traffic
 ```
 Total notifications/day     = 110M
-Notifications/sec (avg)     = 110M / 86400 ≈ 1.3K/sec
-Campaign burst              = 100M notifications in 1hr = 27.8K/sec
+Campaign burst              = 100M in 1hr = 27.8K/sec
 
-Push (FCM/APNs)/sec         = 27.8K × 0.6 = 16.7K/sec
+Push/sec                    = 27.8K × 0.6 = 16.7K/sec
 Email/sec                   = 27.8K × 0.3 = 8.3K/sec
 SMS/sec                     = 27.8K × 0.1 = 2.8K/sec
 ```
@@ -50,66 +44,152 @@ SMS/sec                     = 27.8K × 0.1 = 2.8K/sec
 ```
 Notification records/day    = 110M × 300B = 33GB/day → ~12TB/year
 User preferences            = 1B × 500B = 500GB
-Templates                   = thousands × 10KB = small
 Delivery logs               = 110M × 200B = 22GB/day
 ```
 
-## 3. Core Components
+## 3. Architecture Diagram
 
-**API Gateway** — Auth, rate limiting, routing, round-robin for notification submission API
+### Components
 
-**Notification Service** — Receives notification requests from internal services; validates; writes to Notification DB and Notification Outbox in the same DB transaction; CDC publishes outbox entries to Kafka (outbox pattern — prevents lost events on crash)
+| Component | Role |
+|---|---|
+| API Gateway | Auth, rate limiting, routing |
+| Notification Service | Receives requests; validates; writes to DB + Outbox atomically; CDC publishes to Kafka |
+| Template Service | Manages versioned templates; renders content with user variables |
+| User Preference Service | Manages per-channel per-type preferences; publishes changes to Kafka |
+| OTP Service | Generates and validates OTPs; uses critical priority channel |
+| Channel Workers | Consume from Kafka; check user prefs; call providers (FCM/APNs/SendGrid/Twilio) |
+| Delivery Consumer | Consumes delivery receipts from providers; updates Notification DB status |
+| Retry Service | Monitors failed notifications; re-queues with exponential backoff |
+| Notification DB (Cassandra) | Notification records and delivery status; partition by client_id |
+| Template DB (PostgreSQL) | Versioned templates with is_active flag |
+| UserPref DB (PostgreSQL) | User preferences per channel |
+| UserPref Cache (Redis) | Cached preferences; checked before every send |
+| Kafka | Three-tier priority × channel topic matrix |
 
-**Template Service** — Manages versioned notification templates with `is_active` flag; renders content with user-specific variables; reads from Template DB
+### Overview
 
-**User Preference Service** — Manages user notification preferences per channel per type; publishes preference changes to Kafka `user_preference` topic; User Preference Consumer updates UserPref DB
+```mermaid
+flowchart LR
+    caller["Internal Services<br/>Order · Chat · Marketing"]
+    apigw["API Gateway"]
 
-**OTP Service** — Generates and validates one-time passwords for auth flows; separate from general notification pipeline; uses SMS/email channel workers
+    notifSvc["Notification Service<br/>validate · dedup · outbox pattern"]
+    templateSvc["Template Service<br/>render content"]
+    prefSvc["User Preference Service"]
+    otpSvc["OTP Service"]
 
-**Delivery Consumer** — Kafka consumer on `delivery_status` topic; receives delivery receipts from channel providers; updates Notification DB status
+    kafka[("Kafka<br/>critical · standard · promotional<br/>retry · dlq")]
+    channelWorkers["Channel Workers<br/>FCM/APNs · SendGrid · Twilio"]
+    deliveryConsumer["Delivery Consumer<br/>update status"]
+    retrySvc["Retry Service<br/>exponential backoff"]
 
-**User Preference Consumer** — Kafka consumer on `user_preference` topic; updates UserPref DB; ensures preference changes are durable even if direct DB write fails
+    notifDB[("Notification DB<br/>Cassandra")]
+    prefDB[("UserPref DB<br/>PostgreSQL")]
+    redis[("Redis<br/>pref cache · dedup · rate limit")]
+    providers["FCM / APNs<br/>SendGrid / Twilio"]
 
-**Channel Providers:**
-- SMS Service Provider → Twilio / MSG91
-- Email Service Provider → SendGrid / Amazon SES
-- In-App Service Provider → FCM / APNs
+    caller --> apigw
+    apigw --> notifSvc
+    apigw --> otpSvc
+    notifSvc -->|"DB + Outbox (same txn)"| notifDB
+    notifSvc -->|"CDC → publish"| kafka
+    notifSvc --> templateSvc
 
-**Reporting Service** — Consumes notification events; writes to analytics store (BigQuery); powers delivery rate, open rate, campaign performance dashboards
+    otpSvc -->|"critical priority"| kafka
 
-**Retry Service** — Monitors failed notifications; re-queues with exponential backoff to retry topics
+    kafka --> channelWorkers
+    channelWorkers -->|"check pref"| redis
+    redis -.->|"miss"| prefDB
+    channelWorkers --> providers
+    providers -->|"delivery receipt"| deliveryConsumer
+    deliveryConsumer --> notifDB
 
-**Notification DB (Cassandra)** — Notification records and delivery status; partition by `client_id`
+    kafka --> retrySvc
+    retrySvc -->|"backoff retry"| kafka
 
-**Notification Outbox** — Transactional outbox table (same DB as Notification DB); CDC agent reads and publishes to Kafka; guarantees at-least-once Kafka delivery
+    prefSvc --> prefDB
+    prefSvc -->|"invalidate cache"| redis
+```
 
-**Template DB (PostgreSQL)** — Versioned templates with active/inactive flag
+## 4. Key Flows
 
-**UserPref DB (PostgreSQL)** — User preferences per channel; `preferences: {"email": true, "sms": false, "push": true}`
+### 4.1 Transactional Notification (e.g., Order Confirmed)
 
-**UserPref Cache (Redis)** — Cached user preferences; checked before every notification send
+```mermaid
+flowchart LR
+    orderSvc["Order Service"] -->|"POST /notify"| notifSvc["Notification Service"]
+    notifSvc -->|"dedup check SET NX"| redis[("Redis")]
+    notifSvc -->|"DB txn: write notification + outbox"| notifDB[("Notification DB")]
+    notifDB -->|"CDC reads outbox"| kafka[("Kafka<br/>notifications.standard.push")]
+    kafka --> worker["Channel Worker<br/>check UserPref Cache"]
+    worker -->|"opted in: call provider"| fcm["FCM / APNs"]
+    fcm -->|"delivery receipt"| kafka2[("Kafka<br/>delivery_status")]
+    kafka2 --> deliveryConsumer["Delivery Consumer"]
+    deliveryConsumer -->|"status=DELIVERED"| notifDB
+```
 
-**Kafka** — Three-tier topic structure:
-- `notifications.critical.email/sms/push` — OTP, security alerts (highest priority)
-- `notifications.standard.email/sms/push` — transactional (order updates, receipts)
-- `notifications.promotional.email/sms/push` — marketing campaigns
-- `notifications.bulk.email` — bulk sends
-- `notifications.retry` — failed notifications pending retry
-- `notifications.dlq` — dead letter queue (exhausted retries)
-- `user_preference` — preference update events
-- `delivery_status` — delivery receipts from providers
+1. Caller sends `POST /notify` with `{userId, templateId, channel, priority, idempotencyKey}`
+2. Dedup check: `SET dedup:{key} 1 NX EX 86400` — if exists, return cached result
+3. DB transaction: write to Notification DB (`status = PENDING`) + write to Outbox atomically
+4. CDC reads Outbox → publishes to Kafka topic based on `priority × channel`
+5. Channel Worker checks UserPref Cache → if opted out, skip; if opted in, render template + call provider
+6. Provider delivers → receipt published to `delivery_status` topic → Delivery Consumer updates status
 
-## 4. Database Design
+### 4.2 Outbox Pattern — Why It Matters
+
+Without outbox: Notification Service writes to DB, then crashes before publishing to Kafka → notification record exists but never sent.
+
+With outbox: DB write + Outbox write are in the same transaction. CDC reads the Outbox and publishes to Kafka independently. Even if service crashes after DB write, CDC will still publish. Guarantees at-least-once delivery.
+
+### 4.3 Three-Tier Kafka Topics
+
+```
+notifications.critical.push/sms/email   ← OTP, security alerts
+notifications.standard.push/sms/email   ← order updates, receipts
+notifications.promotional.push/sms/email ← marketing campaigns
+notifications.bulk.email                 ← bulk sends
+notifications.retry                      ← failed, pending retry
+notifications.dlq                        ← dead letter (exhausted retries)
+```
+
+Workers drain `critical` before `standard` before `promotional`. OTPs are never delayed by a marketing campaign burst.
+
+### 4.4 OTP Flow
+
+```mermaid
+flowchart LR
+    user["User<br/>login / transaction"] --> otpSvc["OTP Service"]
+    otpSvc -->|"store OTP TTL 5min"| redis[("Redis")]
+    otpSvc -->|"publish"| kafka[("Kafka<br/>notifications.critical.sms")]
+    kafka --> worker["Channel Worker<br/>immediate delivery"]
+    worker --> twilio["Twilio / SMS Provider"]
+    user -->|"submit OTP"| otpSvc
+    otpSvc -->|"validate + delete"| redis
+```
+
+### 4.5 Bulk Campaign
+
+1. Marketing team creates campaign with template, segment, schedule
+2. At scheduled time: campaign job publishes user batches to `notifications.promotional.*`
+3. Channel workers process at their own rate (rate-limited to avoid provider throttling)
+4. Progress tracked via Reporting Service
+
+### 4.6 Retry Logic
+
+Failed notification → `notifications.retry` topic → Retry Service applies exponential backoff (1min, 5min, 30min, 2hr) → after max retries (3) → `notifications.dlq` → alert ops
+
+## 5. Database Design
 
 ### Selection Reasoning
 
 | Store | Why |
 |---|---|
-| Cassandra (Notification DB) | High write throughput for notification records and delivery logs; time-series; partition by client_id |
-| PostgreSQL (UserPref DB) | Structured preferences per channel — ACID, relational |
-| PostgreSQL (Template DB) | Versioned templates, is_active flag, structured |
-| Redis (UserPref Cache) | Sub-ms preference lookup on every notification send |
-| Kafka | Three-tier priority × channel topic matrix; durable queue; independent scaling per topic |
+| Cassandra (Notification DB) | High write throughput; time-series; partition by client_id |
+| PostgreSQL (UserPref DB) | Structured preferences per channel — ACID |
+| PostgreSQL (Template DB) | Versioned templates, is_active flag |
+| Redis (UserPref Cache) | Sub-ms preference lookup on every send |
+| Kafka | Three-tier priority × channel matrix; durable queue |
 
 ### Cassandra — notifications
 
@@ -123,26 +203,10 @@ Partition key: `client_id`
 | template_id | UUID |
 | channel | ENUM (push / email / sms / in_app) |
 | payload | JSONB |
-| status | ENUM (PENDING / SCHEDULED / SENT / DELIVERED / FAILED / CANCELLED) |
+| status | ENUM (PENDING / SENT / DELIVERED / FAILED / CANCELLED) |
 | priority | ENUM (high / normal / low) |
 | scheduled_at | TIMESTAMP, nullable |
 | last_updated_at | TIMESTAMP |
-| metadata | JSONB |
-
-### PostgreSQL — templates
-
-| Field | Type |
-|---|---|
-| template_id | UUID (PK) |
-| name | VARCHAR |
-| type | ENUM (transactional / promotional) |
-| channel | ENUM (push / email / sms) |
-| content | TEXT |
-| variables | JSONB (list of variable names) |
-| version | INT |
-| is_active | BOOLEAN |
-| created_at | TIMESTAMP |
-| updated_at | TIMESTAMP |
 
 ### PostgreSQL — user_preferences
 
@@ -154,6 +218,20 @@ Partition key: `client_id`
 | preferences | JSONB (`{"email": true, "sms": false, "push": true}`) |
 | updated_at | TIMESTAMP |
 
+### PostgreSQL — templates
+
+| Field | Type |
+|---|---|
+| template_id | UUID (PK) |
+| name | VARCHAR |
+| type | ENUM (transactional / promotional) |
+| channel | ENUM (push / email / sms) |
+| content | TEXT |
+| variables | JSONB |
+| version | INT |
+| is_active | BOOLEAN |
+| created_at | TIMESTAMP |
+
 ### Redis Keys
 
 | Key Pattern | Type | Value | TTL |
@@ -162,162 +240,41 @@ Partition key: `client_id`
 | `dedup:{idempotencyKey}` | String | notificationId | 86400s |
 | `rate:{userId}` | Counter | notifications sent in window | 3600s |
 
-## 5. Key Flows
-
-### 5.1 Transactional Notification (e.g., Order Confirmed)
-
-```
-Order Service → Notification Service
-                        ↓
-    Validate + dedup check (Redis idempotency key)
-                        ↓
-    DB transaction:
-      Write to Notification DB (status=PENDING)
-      Write to Notification Outbox
-                        ↓
-    CDC reads Outbox → publishes to Kafka
-    (notifications.standard.email / sms / push)
-                        ↓
-    Channel worker consumes:
-      Check UserPref Cache → UserPref DB
-      If channel enabled: call provider
-                        ↓
-    Provider delivers → publishes to delivery_status topic
-                        ↓
-    Delivery Consumer updates Notification DB (status=DELIVERED)
-```
-
-1. Caller sends `POST /notify` with `{clientId, userId, templateId, channel, payload, priority, idempotencyKey}`
-2. Notification Service checks Redis dedup: `SET dedup:{key} 1 NX EX 86400` — if exists, return cached result
-3. DB transaction: write to Notification DB (`status = PENDING`) + write to Outbox table atomically
-4. CDC agent reads Outbox, publishes to appropriate Kafka topic based on `priority × channel`
-5. Channel worker consumes, checks UserPref Cache for user's channel preference
-6. If opted out: skip, update status to `CANCELLED`
-7. If opted in: render template, call provider (FCM/APNs/SendGrid/Twilio)
-8. Provider delivers and sends receipt → published to `delivery_status` topic
-9. Delivery Consumer updates Notification DB status
-
-### 5.2 Why the Outbox Pattern
-Risk without outbox: Notification Service writes to DB, then crashes before publishing to Kafka → notification record exists but never sent. With outbox:
-- DB write + outbox write are in the same transaction — both succeed or both fail
-- CDC reads the outbox and publishes to Kafka independently
-- Even if service crashes after DB write, CDC will still publish
-- Guarantees at-least-once Kafka delivery
-
-### 5.3 Three-Tier Kafka Topics
-
-```
-Priority × Channel matrix:
-
-notifications.critical.push   ← OTP, security alerts
-notifications.critical.sms
-notifications.critical.email
-
-notifications.standard.push   ← order updates, receipts
-notifications.standard.sms
-notifications.standard.email
-
-notifications.promotional.push ← marketing campaigns
-notifications.promotional.sms
-notifications.promotional.email
-
-notifications.bulk.email       ← bulk sends (newsletters)
-notifications.retry            ← failed, pending retry
-notifications.dlq              ← dead letter (exhausted retries)
-```
-
-Workers drain `critical` topics before `standard`; `standard` before `promotional`. This ensures OTPs are never delayed by a marketing campaign burst.
-
-### 5.4 OTP Flow
-
-1. User requests OTP (login, transaction confirmation)
-2. OTP Service generates 6-digit code, stores in Redis with 5min TTL
-3. Publishes to `notifications.critical.sms` or `notifications.critical.email`
-4. Channel worker delivers immediately (critical priority, no queue wait)
-5. User submits OTP → OTP Service validates against Redis value
-6. On success: delete Redis key (single use)
-
-### 5.5 User Preference Update
-
-1. User updates preferences in app → User Preference Service
-2. Publishes to Kafka `user_preference` topic
-3. User Preference Consumer consumes → updates UserPref DB
-4. Invalidates Redis UserPref Cache: `DEL userpref:{userId}`
-5. Next notification for this user fetches fresh preferences
-
-Using Kafka for preference updates (rather than direct DB write) ensures durability — if the DB write fails, the event is retained in Kafka and retried.
-
-### 5.6 Bulk Campaign
-
-1. Marketing team creates campaign with template, segment, schedule
-2. At scheduled time: campaign job publishes user batches to `notifications.promotional.*` topics
-3. Channel workers process at their own rate (rate-limited to avoid provider throttling)
-4. Progress tracked via Reporting Service consuming notification events
-
-### 5.7 Retry Logic
-
-1. Channel worker fails → publishes to `notifications.retry` with `retry_count`
-2. Retry Service applies exponential backoff: 1min, 5min, 30min, 2hr
-3. After max retries (3): publish to `notifications.dlq`, update status = `FAILED`
-4. Dead letter: alert ops, available for manual re-trigger
-
 ## 6. Key Interview Concepts
 
-### Outbox Pattern — Guaranteed Kafka Delivery
-The classic problem: service writes to DB, then crashes before publishing to Kafka → event lost. Solution: write to DB and an Outbox table in the same transaction. CDC agent reads the Outbox and publishes to Kafka independently. Even if the service crashes, CDC will publish. Guarantees at-least-once delivery without distributed transactions.
+### Outbox Pattern
+Classic problem: service writes to DB, crashes before publishing to Kafka → event lost. Solution: write to DB and Outbox table in same transaction; CDC publishes to Kafka independently. Guarantees at-least-once delivery without distributed transactions.
 
 ### Three-Tier Priority × Channel Topics
-Flat topic structure (`notifications.email`) means a marketing campaign burst delays OTPs. Priority × channel matrix solves this:
-- Workers drain `critical` before `standard` before `promotional`
-- Each topic scales independently
-- OTP (critical) is never blocked by a 100M-user campaign (promotional)
+Flat topic structure means a marketing campaign burst delays OTPs. Priority × channel matrix solves this: workers drain `critical` before `standard` before `promotional`. Each topic scales independently.
 
 ### Idempotency
-Same notification must not be sent twice on retry. `idempotency_key = hash(sourceEventId + userId + channel)` checked in Redis before processing. If key exists: return original result. TTL = 24hr covers the retry window.
+`idempotency_key = hash(sourceEventId + userId + channel)` checked in Redis before processing. If key exists: return original result. TTL = 24hr covers the retry window.
 
 ### Channel Abstraction
-Callers specify `{userId, templateId, priority}` — not the channel. Notification Service decides channels based on user preferences. Decouples callers from channel implementation. Adding a new channel (WhatsApp) requires no changes to callers.
+Callers specify `{userId, templateId, priority}` — not the channel. Notification Service decides channels based on user preferences. Decouples callers from channel implementation. Adding WhatsApp requires no changes to callers.
 
 ### Template Versioning
-Templates have a `version` field and `is_active` flag. Multiple versions can exist; only `is_active = true` version is used. Allows A/B testing of notification copy and safe rollback if a template causes issues.
-
-### OTP as Critical Priority
-OTPs must be delivered in seconds — user is waiting at a login screen. Publishing to `notifications.critical.sms` ensures it's processed before any standard or promotional notification. OTP Service also stores the code in Redis with TTL for fast validation.
+Templates have `version` field and `is_active` flag. Allows A/B testing of notification copy and safe rollback.
 
 ### Rate Limiting Per User
-Prevent notification spam: max N notifications/hr per user. Redis counter: `INCR rate:{userId}` with 1hr TTL. Transactional and critical notifications bypass rate limit; promotional notifications are rate-limited.
-
-### Delivery Tracking via Separate Consumer
-Delivery Consumer is separate from channel workers — it only handles status updates from providers. This separation means delivery tracking scales independently and a slow status update doesn't block new sends.
+Max N notifications/hr per user. Redis counter: `INCR rate:{userId}` with 1hr TTL. Transactional and critical notifications bypass rate limit; promotional are rate-limited.
 
 ## 7. Failure Scenarios
 
-### Notification Service Crash After DB Write (Before Kafka Publish)
-- Without outbox: notification record exists but never sent
-- With outbox: CDC reads outbox and publishes to Kafka regardless of service state
-- Recovery: automatic — CDC catches up on restart
+### Notification Service Crash After DB Write
+- Without outbox: notification never sent
+- With outbox: CDC catches up and publishes to Kafka regardless of service state
 
 ### FCM/APNs Outage
-- Impact: push notifications not delivered
-- Recovery: retry queue with backoff; fall back to SMS/email if configured; alert ops
+- Recovery: retry queue with backoff; fall back to SMS/email if configured
 - Prevention: circuit breaker on push worker; monitor provider status
 
-### Email Provider Rate Limit
-- Detection: SendGrid returns 429
-- Recovery: exponential backoff retry; switch to backup provider (SES)
-- Prevention: stay within provider limits; spread campaign sends over time
-
 ### Kafka Consumer Lag
-- Impact: notification delivery delayed
-- Recovery: scale up channel workers; Kafka retains messages; critical topics prioritized
+- Recovery: scale up channel workers; critical topics prioritized
 - Prevention: monitor consumer lag per topic; auto-scale on lag threshold
 
 ### User Preference Cache Stale
-- Scenario: user opts out but Redis cache still shows opted-in → notification sent
-- Recovery: short TTL (5min) limits window; on opt-out, actively invalidate cache via User Preference Consumer
+- Scenario: user opts out but Redis cache shows opted-in → notification sent
+- Recovery: short TTL (5min); on opt-out, actively invalidate cache
 - Prevention: cache invalidation on preference change; TTL as safety net
-
-### Dead Letter Queue Buildup
-- Scenario: provider outage causes many notifications to exhaust retries
-- Recovery: ops team re-triggers after provider recovery; bulk re-queue from DLQ
-- Prevention: monitor DLQ depth; alert on threshold

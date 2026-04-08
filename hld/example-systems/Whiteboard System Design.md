@@ -3,9 +3,6 @@
 ## System Overview
 A real-time collaborative whiteboard (think Miro / FigJam / Excalidraw) where multiple users simultaneously draw, add shapes, text, and sticky notes on an infinite canvas — with real-time sync, conflict resolution, and persistent state.
 
-## Architecture Diagram
-#### (To be inserted)
-
 ## 1. Requirements
 
 ### Functional Requirements
@@ -29,14 +26,11 @@ A real-time collaborative whiteboard (think Miro / FigJam / Excalidraw) where mu
 
 ### Assumptions
 - 10M DAU, 100K concurrent collaborative sessions at peak
-- Each session generates ~100 drawing ops/min (strokes, shapes)
-- Average op size: 200B (coordinates, style, type)
-- Average board size: 5MB (shapes, text, image references)
-- Board snapshot every 5 min or 100 ops
+- Each session generates ~100 drawing ops/min; average op size: 200B
+- Average board size: 5MB; board snapshot every 5 min or 100 ops
 
 ### Traffic
 ```
-Active sessions at peak  = 100K
 Ops/sec                  = 100K × 100/60 ≈ 167K ops/sec
 Presence updates/sec     = 100K × 2/sec = 200K/sec (cursor moves)
 ```
@@ -45,38 +39,138 @@ Presence updates/sec     = 100K × 2/sec = 200K/sec (cursor moves)
 ```
 Boards              = 1M × 5MB = 5TB
 Op log/day          = 167K × 200B × 86400 = 2.9TB/day (rolling 30 days = 87TB)
-Snapshots           = 1M boards × 5MB = 5TB
 ```
 
-## 3. Core Components
+## 3. Architecture Diagram
 
-**API Gateway** — Auth, rate limiting, routing
+### Components
 
-**WebSocket Gateway** — Persistent connections for real-time collaboration; consistent hashing on `boardId`
+| Component | Role |
+|---|---|
+| API Gateway | Auth, rate limiting, routing |
+| WebSocket Gateway | Persistent connections; consistent hashing on boardId |
+| Board Service | Board CRUD, metadata, permissions, sharing |
+| Collaboration Service | Core real-time engine; receives drawing ops; applies CRDT merge; broadcasts to collaborators |
+| CRDT Engine | Conflict-free Replicated Data Type for drawing ops; runs inside Collaboration Service |
+| Snapshot Service | Periodically computes and stores full board snapshots from op log |
+| Presence Service | Tracks cursor positions and active users per board; ephemeral, Redis-based |
+| Export Service | Renders board to image/PDF on demand |
+| Board DB (PostgreSQL) | Board metadata, permissions, version info |
+| Op Log (Cassandra) | Append-only drawing operation log; partition by boardId |
+| Snapshot Store (S3) | Full board state snapshots (JSON) |
+| Redis | Active board state cache, cursor presence, session store |
+| Kafka | Op events for snapshot triggers, analytics |
 
-**Board Service** — Board CRUD, metadata, permissions, sharing; writes to Board DB
+### Overview
 
-**Collaboration Service** — Core real-time engine; receives drawing ops via WebSocket; applies CRDT merge; broadcasts to collaborators; persists to op log
+```mermaid
+flowchart LR
+    client["Client<br/>drawing app"]
+    apigw["API Gateway"]
+    wsgw["WebSocket Gateway<br/>consistent hash on boardId"]
 
-**CRDT Engine** — Conflict-free Replicated Data Type for drawing operations; runs inside Collaboration Service; ensures all clients converge to same state without central locking
+    boardSvc["Board Service<br/>CRUD · permissions"]
+    collabSvc["Collaboration Service<br/>CRDT engine · broadcast"]
+    snapshotSvc["Snapshot Service"]
+    presenceSvc["Presence Service"]
+    exportSvc["Export Service"]
 
-**Snapshot Service** — Periodically computes and stores full board snapshots from op log; triggered by Kafka
+    kafka[("Kafka<br/>op events")]
+    boardDB[("Board DB<br/>PostgreSQL")]
+    opLog[("Op Log<br/>Cassandra<br/>partition by boardId")]
+    s3[("S3<br/>snapshots")]
+    redis[("Redis<br/>board:state · presence · sessions")]
 
-**Presence Service** — Tracks cursor positions and active users per board; ephemeral, Redis-based
+    client -->|"REST"| apigw
+    client -->|"WebSocket"| wsgw
+    apigw --> boardSvc
+    wsgw --> collabSvc
 
-**Export Service** — Renders board to image/PDF on demand; reads from snapshot + recent ops
+    boardSvc --> boardDB
+    collabSvc --> redis
+    collabSvc --> opLog
+    collabSvc -->|"broadcast"| client
+    collabSvc -->|"op events"| kafka
 
-**Board DB (PostgreSQL)** — Board metadata, permissions, version info
+    kafka --> snapshotSvc
+    snapshotSvc --> s3
+    snapshotSvc --> boardDB
 
-**Op Log (Cassandra)** — Append-only drawing operation log; partition by boardId
+    presenceSvc --> redis
+    exportSvc --> s3
+    exportSvc --> opLog
+```
 
-**Snapshot Store (S3)** — Full board state snapshots (JSON)
+## 4. Key Flows
 
-**Redis** — Active board state cache, cursor presence, session store
+### 4.1 Auth & Board Open
 
-**Kafka** — Op events for snapshot triggers, analytics
+```mermaid
+flowchart LR
+    client["Client"] -->|"open board"| boardSvc["Board Service<br/>check permission"]
+    boardSvc --> boardDB[("Board DB")]
+    boardSvc -->|"load snapshot"| s3[("S3")]
+    boardSvc -->|"load ops since snapshot"| opLog[("Op Log<br/>Cassandra")]
+    boardSvc -->|"board state + version"| client
+    client -->|"WebSocket connect"| wsgw["WebSocket Gateway"]
+    wsgw --> collabSvc["Collaboration Service"]
+```
 
-## 4. Database Design
+1. Check permission → load latest snapshot from S3 (or Redis cache if hot)
+2. Load ops since `last_snapshot_version` from Cassandra → apply → reconstruct current state
+3. Return board state + current version to client
+4. Client connects WebSocket to Collaboration Service (routed by boardId)
+
+### 4.2 Real-Time Drawing (CRDT-based)
+
+```mermaid
+flowchart LR
+    client["Client<br/>draw stroke"] -->|"op: {boardId, elementId, opType, payload, version}"| collabSvc["Collaboration Service"]
+    collabSvc -->|"apply op to board state"| redis[("Redis<br/>board:state")]
+    collabSvc -->|"increment version"| redis
+    collabSvc -->|"write op"| opLog[("Op Log<br/>Cassandra")]
+    collabSvc -->|"broadcast op to all sessions"| otherClients["Other Clients"]
+    collabSvc -->|"ACK + new version"| client
+    collabSvc -->|"publish"| kafka[("Kafka")]
+```
+
+CRDT approach:
+- Each element (shape, stroke, text) has a globally unique `elementId` (UUID)
+- Operations: `add(elementId, data)`, `move(elementId, newPos)`, `delete(elementId)`, `update(elementId, props)`
+- Deletes use tombstones — element marked deleted, never truly removed
+- Concurrent moves of same element: last-write-wins by timestamp
+- No lock needed — each op targets a specific `elementId`
+
+### 4.3 Cursor Presence
+
+```mermaid
+flowchart LR
+    client["Client<br/>cursor move every 100ms"] --> collabSvc["Collaboration Service"]
+    collabSvc -->|"SET presence:{boardId}:{userId} {x,y,color} EX 5"| redis[("Redis")]
+    collabSvc -->|"broadcast cursor update"| otherClients["Other Clients"]
+```
+
+TTL = 5s — cursor disappears if user stops moving (idle/disconnected).
+
+### 4.4 Snapshotting
+
+```mermaid
+flowchart LR
+    kafka[("Kafka<br/>op events")] --> snapshotSvc["Snapshot Service<br/>trigger every 100 ops or 5min"]
+    snapshotSvc -->|"read board state"| redis[("Redis")]
+    snapshotSvc -->|"write snapshot JSON"| s3[("S3<br/>snapshots/{boardId}/{version}.json")]
+    snapshotSvc -->|"update last_snapshot_version"| boardDB[("Board DB")]
+```
+
+### 4.5 Undo/Redo
+
+Client-side undo/redo stack:
+- Each client maintains local undo stack of ops it generated
+- Undo: send inverse op (e.g., delete the element that was added)
+- Inverse ops go through normal CRDT flow — all clients see the undo
+- Collaborative undo: only undo your own ops (not others')
+
+## 5. Database Design
 
 ### Selection Reasoning
 
@@ -97,7 +191,6 @@ Snapshots           = 1M boards × 5MB = 5TB
 | latest_version | BIGINT |
 | last_snapshot_version | BIGINT |
 | created_at | TIMESTAMP |
-| updated_at | TIMESTAMP |
 
 ### PostgreSQL — board_permissions
 
@@ -129,77 +222,8 @@ Partition key: `board_id`, Clustering: `version ASC`
 | `board:state:{boardId}` | String | full board JSON | while active |
 | `board:version:{boardId}` | String | current version | while active |
 | `board:sessions:{boardId}` | Set | connected sessionIds | — |
-| `presence:{boardId}:{userId}` | String | `{x, y, color, name}` | 5s (heartbeat) |
+| `presence:{boardId}:{userId}` | String | `{x, y, color, name}` | 5s |
 | `session:{sessionId}` | String | userId | 86400s |
-
-## 5. Key Flows
-
-### 5.1 Auth & Board Open
-
-1. User logs in → JWT issued, session in Redis
-2. User opens board → Board Service checks permission
-3. Load latest snapshot from S3 (or Redis cache if hot)
-4. Load ops since `last_snapshot_version` from Cassandra
-5. Apply ops → reconstruct current board state
-6. Return board state + current version to client
-7. Client connects WebSocket to Collaboration Service (routed by boardId)
-
-### 5.2 Real-Time Drawing (CRDT-based)
-
-Whiteboard uses CRDT instead of OT (unlike Google Docs) because:
-- Drawing ops are mostly commutative (adding a shape doesn't depend on position of other shapes)
-- No central lock needed — each element has a globally unique ID
-- Better for offline-first and P2P scenarios
-
-**CRDT approach for whiteboard:**
-- Each element (shape, stroke, text) has a globally unique `elementId` (UUID)
-- Operations: `add(elementId, data)`, `move(elementId, newPos)`, `delete(elementId)`, `update(elementId, props)`
-- Deletes use tombstones — element marked deleted, never truly removed from CRDT state
-- Concurrent moves of same element: last-write-wins by timestamp (acceptable for drawing)
-
-**Flow:**
-1. User draws stroke → client generates `elementId` (UUID), creates op
-2. Client sends op via WebSocket: `{boardId, elementId, opType, payload, version}`
-3. Collaboration Service applies op to board state in Redis
-4. Increments version, writes op to Cassandra op log
-5. Broadcasts op to all other sessions in `board:sessions:{boardId}`
-6. ACK sender with new version
-7. Publish to Kafka (for snapshot trigger)
-
-**No lock needed:** each op targets a specific `elementId`. Two users drawing different elements simultaneously → no conflict. Two users moving the same element → last-write-wins by timestamp.
-
-### 5.3 Cursor Presence
-
-1. Client sends cursor position every 100ms via WebSocket
-2. Collaboration Service updates Redis: `SET presence:{boardId}:{userId} {x,y,color} EX 5`
-3. Broadcasts cursor update to all other sessions
-4. TTL = 5s — cursor disappears if user stops moving (idle/disconnected)
-5. On board open: fetch all active cursors from Redis
-
-### 5.4 Undo/Redo
-
-Client-side undo/redo stack:
-- Each client maintains local undo stack of ops it generated
-- Undo: send inverse op (e.g., delete the element that was added)
-- Redo: re-send the original op
-- Collaborative undo: only undo your own ops (not others')
-- Inverse ops go through normal CRDT flow — all clients see the undo
-
-### 5.5 Snapshotting
-
-1. Kafka consumer (Snapshot Service) triggers every 100 ops or 5 min per active board
-2. Reads current board state from Redis
-3. Serializes to JSON, writes to S3: `snapshots/{boardId}/{version}.json`
-4. Updates `last_snapshot_version` in PostgreSQL
-
-### 5.6 Export
-
-1. User requests export → Export Service
-2. Loads latest snapshot from S3
-3. Applies any ops since snapshot from Cassandra
-4. Renders board to canvas (server-side headless browser or canvas library)
-5. Exports as PNG/PDF
-6. Returns download URL (stored in S3)
 
 ## 6. Key Interview Concepts
 
@@ -211,32 +235,29 @@ Google Docs uses OT (requires central server, lock per document). Whiteboards us
 - Trade-off: CRDT has higher memory overhead (tombstones for deleted elements)
 
 ### Element-Based vs Pixel-Based
-Two approaches to representing whiteboard state:
-- **Pixel-based:** store bitmap; simple but large, hard to edit individual elements
-- **Element-based (vector):** store shapes, strokes as structured data; smaller, editable, scalable
+- Pixel-based: store bitmap; simple but large, hard to edit individual elements
+- Element-based (vector): store shapes, strokes as structured data; smaller, editable, scalable
 This design uses element-based — each shape/stroke is a JSON object with coordinates and style.
 
 ### Infinite Canvas
-Canvas has no fixed size. Client maintains viewport (pan + zoom). Server stores absolute coordinates. Client transforms coordinates based on current viewport. No server-side concept of "canvas size" — just a coordinate space.
+Canvas has no fixed size. Client maintains viewport (pan + zoom). Server stores absolute coordinates. Client transforms coordinates based on current viewport.
 
 ### Consistent Hashing for Collaboration Service
-Same as Google Docs design — WebSocket Gateway uses consistent hashing on `boardId` to route all connections for the same board to the same Collaboration Service instance. Warm in-memory board state, no cross-instance coordination for most ops.
+WebSocket Gateway uses consistent hashing on `boardId` to route all connections for the same board to the same Collaboration Service instance. Warm in-memory board state, no cross-instance coordination.
 
 ### Offline Drawing
-User draws offline → ops queued locally with `baseVersion = last known`. On reconnect: send queued ops to Collaboration Service. Server fetches ops since `baseVersion` from Cassandra. CRDT merges offline ops with server ops — no conflicts for independent elements. Concurrent moves of same element: last-write-wins.
+User draws offline → ops queued locally with `baseVersion = last known`. On reconnect: send queued ops. Server fetches ops since `baseVersion` from Cassandra. CRDT merges offline ops with server ops — no conflicts for independent elements.
 
 ### Presence Scalability
-100K concurrent sessions × 2 cursor updates/sec = 200K Redis writes/sec. Redis handles this easily. Cursor updates are fire-and-forget — no ACK needed. TTL auto-cleans stale cursors.
+100K sessions × 2 cursor updates/sec = 200K Redis writes/sec. Redis handles this easily. Cursor updates are fire-and-forget — no ACK needed. TTL auto-cleans stale cursors.
 
 ## 7. Failure Scenarios
 
 ### Collaboration Service Crash
-- Detection: WebSocket connections drop
 - Recovery: clients reconnect; consistent hashing routes to new instance; new instance loads board state from Redis; clients resend pending ops
 - Prevention: Redis holds board state independently of any instance
 
 ### Redis Failure (Board State Lost)
-- Impact: active sessions lose in-memory state; all users effectively disconnected
 - Recovery: Redis Sentinel failover (<30s); board state reconstructed from S3 snapshot + Cassandra ops on reconnect
 - Prevention: Redis Cluster + AOF; board state is a cache, Cassandra is the truth
 
@@ -247,7 +268,7 @@ User draws offline → ops queued locally with `baseVersion = last known`. On re
 ### Concurrent Move Conflict (Same Element)
 - Scenario: two users move the same shape simultaneously
 - Recovery: last-write-wins by timestamp; one user's move wins; other user sees their move reverted
-- This is acceptable UX for drawing — users can see the conflict and re-move
+- Acceptable UX for drawing — users can see the conflict and re-move
 
 ### Large Board Performance
 - Scenario: board with 100K elements; loading takes too long

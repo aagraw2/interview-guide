@@ -3,9 +3,6 @@
 ## System Overview
 An online coding platform where users solve programming problems, submit code that is compiled and executed in a sandboxed environment, and receive verdicts (Accepted, Wrong Answer, Time Limit Exceeded, etc.) — with a leaderboard, contests, and discussion forums.
 
-## Architecture Diagram
-#### (To be inserted)
-
 ## 1. Requirements
 
 ### Functional Requirements
@@ -31,61 +28,154 @@ An online coding platform where users solve programming problems, submit code th
 - 5M users, 500K DAU
 - 1M submissions/day, 100K during contest peaks
 - Average execution time: 1–2s
-- Average code size: 2KB
 - 10 test cases per problem avg
 
 ### Traffic
 ```
 Submissions/sec (avg)   = 1M / 86400 ≈ 12/sec
 Submissions/sec (peak)  = 100K / 3600 ≈ 28/sec (contest hour)
-
 Execution jobs/sec      = 28 × 10 test cases = 280 jobs/sec (peak)
 ```
 
 ### Storage
 ```
-Problems            = 3000 × 10KB = 30MB (tiny)
-Submissions/day     = 1M × 2KB code + 1KB metadata = 3GB/day → ~1TB/year
-Test cases          = 3000 problems × 10 cases × 10KB = 300MB
+Problems        = 3000 × 10KB = 30MB
+Submissions/day = 1M × 3KB = 3GB/day → ~1TB/year
+Test cases      = 3000 × 10 cases × 10KB = 300MB
 ```
 
-## 3. Core Components
+## 3. Architecture Diagram
 
-**API Gateway** — Auth, rate limiting (prevent submission spam), routing
+### Components
 
-**Problem Service** — Problem CRUD, test case management; reads/writes to Problem DB
+| Component | Role |
+|---|---|
+| API Gateway | Auth, rate limiting (prevent submission spam), routing |
+| Problem Service | Problem CRUD, test case management |
+| Submission Service | Receives code; validates; publishes to Kafka; returns submissionId async |
+| Code Execution Service (Judge) | Pulls from Kafka; runs code in sandbox; evaluates against test cases; writes verdict |
+| Sandbox | Isolated Docker container per submission; resource limits; no network |
+| Contest Service | Contest lifecycle, scoring, real-time leaderboard (Redis ZSET) |
+| Discussion Service | Forum threads per problem |
+| Search Service | Problem search via Elasticsearch |
+| Problem DB (PostgreSQL) | Problems, test cases, editorial |
+| Submission DB (PostgreSQL) | Submission records, verdicts, code |
+| User DB (MySQL) | Users, solved problems, stats |
+| Redis | Contest leaderboard (ZSET), submission status, session store |
+| Kafka | Submission queue, result events |
 
-**Submission Service** — Receives code submissions; validates; publishes to execution queue (Kafka); returns `submissionId` immediately (async)
+### Overview
 
-**Code Execution Service (Judge)** — The core component; pulls jobs from Kafka; runs code in isolated sandbox; evaluates against test cases; writes verdict to Submission DB
+```mermaid
+flowchart LR
+    client["Client"]
+    apigw["API Gateway<br/>auth · rate limit"]
 
-**Sandbox** — Isolated execution environment per submission:
-- Docker container with resource limits (CPU, memory, time)
-- No network access
-- Read-only filesystem except temp dir
-- Killed after time limit
+    problemSvc["Problem Service"]
+    submissionSvc["Submission Service<br/>validate · publish · 202"]
+    judgeSvc["Code Execution Service<br/>Judge"]
+    sandbox["Sandbox<br/>Docker · no network<br/>CPU/memory limits"]
+    contestSvc["Contest Service"]
+    searchSvc["Search Service"]
 
-**Contest Service** — Manages contest lifecycle, scoring, real-time leaderboard (Redis ZSET)
+    kafka[("Kafka<br/>submissions")]
+    problemDB[("Problem DB<br/>PostgreSQL")]
+    submissionDB[("Submission DB<br/>PostgreSQL")]
+    userDB[("User DB<br/>MySQL")]
+    redis[("Redis<br/>contest ZSET · status")]
+    elastic[("Elasticsearch")]
 
-**Discussion Service** — Forum threads per problem; comments, upvotes
+    client --> apigw
+    apigw --> problemSvc
+    apigw --> submissionSvc
+    apigw --> contestSvc
+    apigw --> searchSvc
 
-**Search Service** — Problem search by title, tag, difficulty, company; Elasticsearch
+    problemSvc --> problemDB
+    submissionSvc -->|"publish"| kafka
+    submissionSvc -->|"status=pending"| submissionDB
 
-**Notification Service** — Kafka consumer; sends submission result notification
+    kafka --> judgeSvc
+    judgeSvc --> sandbox
+    judgeSvc -->|"write verdict"| submissionDB
+    judgeSvc -->|"update status"| redis
 
-**Problem DB (PostgreSQL)** — Problems, test cases, editorial
+    contestSvc --> redis
+    searchSvc --> elastic
+    problemDB -.->|"CDC"| elastic
+    userDB -.->|"user lookup"| submissionSvc
+```
 
-**Submission DB (PostgreSQL)** — Submission records, verdicts, code
+## 4. Key Flows
 
-**User DB (MySQL)** — Users, solved problems, stats
+### 4.1 Code Submission
 
-**Redis** — Contest leaderboard (ZSET), submission status polling, session store
+```mermaid
+flowchart LR
+    client["Client"] -->|"POST /submit<br/>{code, language, problemId}"| submissionSvc["Submission Service"]
+    submissionSvc -->|"rate limit check"| redis[("Redis")]
+    submissionSvc -->|"status=pending"| submissionDB[("Submission DB")]
+    submissionSvc -->|"publish"| kafka[("Kafka")]
+    submissionSvc -->|"202 + submissionId"| client
+    client -->|"poll GET /submission/{id} every 2s"| submissionSvc
+```
 
-**Kafka** — Submission queue, result events
+1. Rate limit: 5 submissions/min per user
+2. Write submission record with `status = pending`
+3. Publish to Kafka → return `submissionId` immediately (async)
+4. Client polls for result every 2s (or WebSocket push)
 
-**S3** — Large test case files, editorial assets
+### 4.2 Code Execution (Judge)
 
-## 4. Database Design
+```mermaid
+flowchart LR
+    kafka[("Kafka")] --> judgeSvc["Code Execution Service"]
+    judgeSvc -->|"spin up"| sandbox["Docker Sandbox<br/>--network none<br/>--memory 256m<br/>--read-only"]
+    sandbox -->|"compile"| sandbox
+    sandbox -->|"run each test case"| sandbox
+    judgeSvc -->|"compare output vs expected"| judgeSvc
+    judgeSvc -->|"write verdict"| submissionDB[("Submission DB")]
+    judgeSvc -->|"SET submission:status:{id}"| redis[("Redis")]
+```
+
+Verdict determination:
+```
+Compile Error → return CE
+For each test case:
+  TLE (time > limit) → return TLE
+  MLE (memory > limit) → return MLE
+  Runtime Error → return RE
+  Wrong Answer → return WA
+All pass → Accepted
+```
+
+Sandbox constraints:
+- `--network none` (no network)
+- `--memory 256m --cpus 0.5`
+- `--read-only` filesystem with tmpfs for /tmp
+- `seccomp` profile to restrict syscalls
+- Run as non-root user; killed after time limit
+
+### 4.3 Contest Leaderboard
+
+```mermaid
+flowchart LR
+    judgeSvc["Judge<br/>Accepted verdict"] -->|"ZINCRBY contest:leaderboard:{id} score userId"| redis[("Redis ZSET")]
+    client["Client"] -->|"GET /contest/{id}/leaderboard"| contestSvc["Contest Service"]
+    contestSvc -->|"ZREVRANGE 0 99 WITHSCORES"| redis
+    redis -->|"top 100 + scores"| client
+```
+
+Score = problems solved × penalty time formula. Real-time updates pushed via WebSocket.
+
+### 4.4 Custom Test Run
+
+Same flow as submission but:
+- Uses user-provided input instead of hidden test cases
+- Not stored in submission history
+- Lower priority in execution queue
+
+## 5. Database Design
 
 ### PostgreSQL — problems
 
@@ -126,18 +216,6 @@ Test cases          = 3000 problems × 10 cases × 10KB = 300MB
 | memory_mb | INT, nullable |
 | submitted_at | TIMESTAMP |
 
-### MySQL — users
-
-| Field | Type |
-|---|---|
-| user_id | UUID (PK) |
-| username | VARCHAR, unique |
-| email | VARCHAR, unique |
-| password_hash | VARCHAR |
-| problems_solved | INT |
-| rating | INT |
-| created_at | TIMESTAMP |
-
 ### Redis Keys
 
 | Key Pattern | Type | Value | TTL |
@@ -147,114 +225,27 @@ Test cases          = 3000 problems × 10 cases × 10KB = 300MB
 | `session:{sessionId}` | String | userId | 86400s |
 | `rate:{userId}` | Counter | submission count | 60s |
 
-## 5. Key Flows
-
-### 5.1 Code Submission
-
-```
-Client → Submission Service
-              ↓
-    Validate: language supported, code size limit, rate limit
-              ↓
-    Write submission to DB (status=pending)
-              ↓
-    Publish to Kafka: {submissionId, code, language, problemId}
-              ↓
-    Return submissionId to client (202 Accepted)
-              ↓
-Client polls GET /submission/{id} every 2s
-```
-
-1. User submits code → Submission Service
-2. Rate limit check (e.g., 5 submissions/min per user)
-3. Write submission record to PostgreSQL with `status = pending`
-4. Publish to Kafka `submissions` topic
-5. Return `submissionId` immediately — async execution
-6. Client polls for result every 2s (or WebSocket push)
-
-### 5.2 Code Execution (Judge)
-
-```
-Kafka → Code Execution Service
-              ↓
-    Pull submission job
-              ↓
-    Spin up Docker sandbox
-              ↓
-    Compile code (if compiled language)
-              ↓
-    For each test case:
-      Run code with input, enforce time + memory limits
-      Compare output to expected
-              ↓
-    Determine verdict (all pass = Accepted, else first failure)
-              ↓
-    Write verdict to Submission DB
-    Update Redis: submission:status:{id} = verdict
-    Publish result to Kafka → Notification Service
-```
-
-**Sandbox constraints:**
-- CPU: 1 core, time limit per test case (e.g., 1–3s)
-- Memory: 256MB limit
-- No network access (iptables rules)
-- No filesystem writes outside /tmp
-- Process killed on limit exceeded
-
-**Verdict determination:**
-```
-Compile Error → stop, return CE
-For each test case:
-  TLE (time > limit) → return TLE
-  MLE (memory > limit) → return MLE
-  Runtime Error (crash, exception) → return RE
-  Wrong Answer (output != expected) → return WA
-All test cases pass → Accepted
-```
-
-### 5.3 Contest Leaderboard
-
-Same as Leaderboard design — Redis ZSET per contest:
-- On accepted submission: `ZINCRBY contest:leaderboard:{contestId} {score} {userId}`
-- Score = problems solved × penalty time formula
-- `ZREVRANGE` for top N; `ZREVRANK` for user's rank
-- Real-time updates pushed via WebSocket
-
-### 5.4 Custom Test Run
-
-Same flow as submission but:
-- Uses user-provided input instead of hidden test cases
-- Not stored in submission history
-- Lower priority in execution queue
-
 ## 6. Key Interview Concepts
 
 ### Sandbox Security
-The most critical aspect. Code must not be able to:
-- Access other users' data
-- Make network calls (exfiltrate data, call external APIs)
-- Fork-bomb or exhaust host resources
-- Write to persistent storage
-
-Solution: Docker container with:
-- `--network none` (no network)
-- `--memory 256m --cpus 0.5` (resource limits)
+Code must not access other users' data, make network calls, or exhaust host resources. Docker container with:
+- `--network none` — no network
+- `--memory 256m --cpus 0.5` — resource limits
 - `--read-only` filesystem with tmpfs for /tmp
 - `seccomp` profile to restrict syscalls
-- Run as non-root user
-- Killed after time limit via `timeout` command
+- Non-root user; killed after time limit
 
 ### Async Execution
-Code execution takes 1–5s. Synchronous HTTP would hold connections open. Solution: async — return `submissionId` immediately, client polls or receives WebSocket push. Kafka queue absorbs submission bursts (contest start spike).
+Code execution takes 1–5s. Synchronous HTTP would hold connections open. Return `submissionId` immediately; client polls or receives WebSocket push. Kafka queue absorbs submission bursts (contest start spike).
 
 ### Execution Queue Scaling
-Contest start: 10K users submit simultaneously. Kafka buffers submissions. Code Execution Service scales horizontally — each instance handles one submission at a time (one Docker container). With 100 executor instances: 100 concurrent executions. Queue drains as executors process.
+Contest start: 10K users submit simultaneously. Kafka buffers submissions. Code Execution Service scales horizontally — each instance handles one submission at a time (one Docker container). With 100 executor instances: 100 concurrent executions.
 
 ### Test Case Isolation
-Each test case runs in a fresh process (not the same process reused). Prevents state leakage between test cases. Some judges reuse the process for performance — trade-off between speed and isolation.
+Each test case runs in a fresh process — prevents state leakage between test cases.
 
 ### Plagiarism Detection
-Post-submission async job: compare accepted solutions using code similarity algorithms (token-based, AST-based). Flag similar submissions for review. Not in critical path.
+Post-submission async job: compare accepted solutions using code similarity algorithms (token-based, AST-based). Not in critical path.
 
 ## 7. Failure Scenarios
 
@@ -264,16 +255,14 @@ Post-submission async job: compare accepted solutions using code similarity algo
 - Submission status remains `pending` until reprocessed
 
 ### Sandbox Escape Attempt
-- Malicious code tries to break out of container
 - Prevention: seccomp profile, non-root user, read-only filesystem, no network
-- Detection: anomaly monitoring on container syscalls; alert security team
+- Detection: anomaly monitoring on container syscalls
 
 ### Execution Queue Backup (Contest Spike)
-- Detection: Kafka consumer lag grows; submission results delayed
+- Detection: Kafka consumer lag grows; results delayed
 - Recovery: auto-scale executor instances; users see "pending" status longer
 - Prevention: pre-scale before known contest start times
 
 ### Wrong Verdict (Judge Bug)
-- Scenario: judge incorrectly marks correct solution as WA
 - Recovery: re-judge all submissions for affected problem; update verdicts
 - Prevention: extensive test case validation; multiple judge instances cross-check results

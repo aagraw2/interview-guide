@@ -3,9 +3,6 @@
 ## System Overview
 A real-time chat application supporting one-on-one messaging, group chats, media sharing, message search, and online presence tracking.
 
-## Architecture Diagram
-#### (To be inserted)
-
 ## 1. Requirements
 
 ### Functional Requirements
@@ -55,27 +52,184 @@ WebSocket registry            = 10M × 1KB  = 10GB
 Recent message cache          = 10M convos × 100 msgs × 100B ≈ 100GB
 ```
 
-## 3. Core Components
+## 3. Architecture Diagram
 
-**API Gateway / LB** — SSL termination, JWT validation, rate limiting, routing
+### Components
 
-**WebSocket Gateway / LB** — Persistent connection entry point, auth, consistent hashing to Chat Service
+| Component | Role |
+|---|---|
+| API Gateway / LB | SSL termination, JWT validation, rate limiting, routing |
+| WebSocket Gateway | Persistent connection entry point; consistent hashing to Chat Service |
+| User Service | Registration, login, JWT issuance, profile management |
+| Chat Service | Maintains WebSocket connections, routes messages, registers connections in Redis |
+| Message Service | Persists messages to Cassandra, updates cache, indexes to Elasticsearch |
+| Group Service | Group CRUD, member management, permission checks |
+| Media Upload Service | Generates pre-signed S3 URLs, triggers compression/thumbnails |
+| Search Service | Full-text search via Elasticsearch |
+| Notification Service | Sends FCM/APNs push notifications to offline users |
+| Cassandra | Write-heavy message store; partition by conversation_id or group_id |
+| PostgreSQL | Structured user/group data, ACID |
+| Redis | WebSocket registry, online presence, message cache, Pub/Sub |
+| S3 + CDN | Media storage and edge delivery |
+| Elasticsearch | Full-text message search |
 
-**User Service** — Registration, login, JWT issuance, profile management
+### Overview
 
-**Chat Service** — Maintains WebSocket connections, routes messages, registers connections in Redis
+```mermaid
+flowchart LR
+    clients["Clients<br/>mobile / web"]
+    apigw["API Gateway / LB<br/>JWT · rate limit"]
+    wsgw["WebSocket Gateway<br/>consistent hash → Chat Svc"]
 
-**Message Service** — Persists messages to Cassandra, updates cache, publishes to Elasticsearch
+    userSvc["User Service"]
+    chatSvc["Chat Service<br/>WebSocket connections"]
+    msgSvc["Message Service<br/>persist · cache · index"]
+    groupSvc["Group Service"]
+    mediaSvc["Media Upload Service"]
+    searchSvc["Search Service"]
+    notifSvc["Notification Service<br/>FCM / APNs"]
 
-**Group Service** — Group CRUD, member management, permission checks
+    redis[("Redis<br/>WS registry · presence<br/>message cache")]
+    cassandra[("Cassandra<br/>messages_by_conversation<br/>messages_by_group")]
+    postgres[("PostgreSQL<br/>users · groups")]
+    s3[("S3 + CDN<br/>media")]
+    elastic[("Elasticsearch<br/>message index")]
 
-**Media Upload Service** — Generates pre-signed S3 URLs, triggers post-processing (compression, thumbnails)
+    clients -->|"REST"| apigw
+    clients -->|"WebSocket"| wsgw
+    apigw --> userSvc
+    apigw --> groupSvc
+    apigw --> mediaSvc
+    apigw --> searchSvc
+    wsgw --> chatSvc
 
-**Message Search Service** — Full-text search via Elasticsearch
+    userSvc --> postgres
+    groupSvc --> postgres
 
-**Notification Service** — Sends FCM/APNs push notifications to offline users
+    chatSvc --> redis
+    chatSvc -->|"Redis Stream"| msgSvc
+    chatSvc -->|"offline"| notifSvc
 
-## 4. Database Design
+    msgSvc --> cassandra
+    msgSvc --> redis
+    msgSvc --> elastic
+
+    mediaSvc --> s3
+    searchSvc --> elastic
+```
+
+## 4. Key Flows
+
+### 4.1 Auth
+
+```mermaid
+flowchart LR
+    client["Client"] -->|"POST /register or /login"| apigw["API Gateway"]
+    apigw --> userSvc["User Service"]
+    userSvc -->|"read/write"| postgres[("PostgreSQL<br/>users")]
+    userSvc -->|"store session"| redis[("Redis<br/>session · TTL 24h")]
+    userSvc -->|"JWT + refresh token"| client
+```
+
+1. Register: validate input → hash password (bcrypt) → write to PostgreSQL → return JWT
+2. Login: validate credentials → generate JWT (1hr) + refresh token → store session in Redis → return tokens
+3. Every request: API Gateway validates JWT signature + expiry + Redis session existence
+
+### 4.2 WebSocket Connection & Presence
+
+```mermaid
+flowchart LR
+    client["Client"] -->|"WS connect + JWT"| wsgw["WebSocket Gateway<br/>consistent hash on userId"]
+    wsgw --> chatSvc["Chat Service"]
+    chatSvc -->|"SET ws:user:{userId}<br/>{connId, serverId} TTL 300s"| redis[("Redis<br/>WS registry · online set")]
+    client -->|"ping every 30s"| chatSvc
+    chatSvc -->|"pong + refresh TTL"| client
+```
+
+1. Client connects with JWT in header
+2. Gateway routes to Chat Service via consistent hashing on userId (same user → same instance)
+3. Chat Service registers: `SET ws:user:{userId} {connId, serverId}` TTL 300s
+4. Adds userId to `online:users` Redis set
+5. Heartbeat: client pings every 30s → server pongs + refreshes TTL
+6. On disconnect: remove from registry, remove from online set, update last seen
+
+### 4.3 One-on-One Message
+
+```mermaid
+flowchart LR
+    sender["Sender"] -->|"send via WebSocket"| chatSvc["Chat Service"]
+    chatSvc -->|"publish"| stream[("Redis Stream")]
+    stream -->|"consume"| msgSvc["Message Service"]
+    msgSvc --> cassandra[("Cassandra<br/>messages_by_conversation")]
+    msgSvc --> redis[("Redis<br/>recent cache")]
+    msgSvc --> elastic[("Elasticsearch")]
+    chatSvc -->|"lookup ws:user:{receiverId}"| redis
+    chatSvc -->|"online: forward"| receiverChatSvc["Receiver's<br/>Chat Service"]
+    receiverChatSvc -->|"WebSocket delivery"| receiver["Receiver"]
+    chatSvc -->|"offline"| notifSvc["Notification Service<br/>FCM / APNs"]
+```
+
+1. Client sends message via WebSocket with client-generated `messageId`
+2. Chat Service publishes to Redis Stream
+3. Message Service consumes → writes to Cassandra (idempotent on `messageId`) → updates Redis cache → indexes to Elasticsearch
+4. Chat Service looks up receiver's connection in Redis
+5. Online → forward to correct Chat Service instance → deliver via WebSocket
+6. Offline → Notification Service sends push notification
+7. Receiver ACKs → status updated to `delivered`; read receipt → status updated to `read` → sender notified
+
+### 4.4 Group Message
+
+```mermaid
+flowchart LR
+    sender["Sender"] -->|"send via WebSocket"| chatSvc["Chat Service<br/>validate membership"]
+    chatSvc -->|"publish groupId"| stream[("Redis Stream")]
+    stream --> msgSvc["Message Service"]
+    msgSvc --> cassandra[("Cassandra<br/>messages_by_group")]
+    chatSvc -->|"Pub/Sub channel<br/>per group"| redis[("Redis")]
+    redis -->|"all subscribed<br/>Chat Svc instances"| onlineMembers["Online Members"]
+    chatSvc -->|"offline members"| notifSvc["Notification Service"]
+```
+
+1. Chat Service validates sender is group member (Redis cache → fallback to PostgreSQL)
+2. Publishes to Redis Stream with `groupId`
+3. Message Service persists to `messages_by_group`
+4. For large groups (1000+): Redis Pub/Sub channel per group — publish once, all subscribed Chat Service instances deliver to their connected members
+5. Offline members get push notifications
+
+### 4.5 Media Upload
+
+```mermaid
+flowchart LR
+    client["Client"] -->|"request pre-signed URL"| apigw["API Gateway"]
+    apigw --> mediaSvc["Media Upload Service"]
+    mediaSvc -->|"generate pre-signed URL"| s3[("S3")]
+    mediaSvc -->|"return URL"| client
+    client -->|"upload directly"| s3
+    s3 -->|"trigger async"| postProcess["Compression<br/>Thumbnail generation"]
+    client -->|"send message with S3 URL"| chatSvc["Chat Service"]
+```
+
+1. Client requests pre-signed S3 URL from Media Upload Service
+2. Client uploads directly to S3 (bypasses app servers)
+3. S3 triggers async post-processing (compression, thumbnails)
+4. Client sends message with returned S3 URL through normal message flow
+5. CDN serves media to recipients
+
+### 4.6 Message Search
+
+```mermaid
+flowchart LR
+    client["Client"] -->|"GET /search?q=..."| apigw["API Gateway"]
+    apigw --> searchSvc["Search Service"]
+    searchSvc -->|"query scoped to userId/groupId"| elastic[("Elasticsearch")]
+    elastic -->|"message snippets + IDs"| client
+```
+
+1. Search query scoped to userId/groupId with full-text match
+2. Returns message snippets + IDs
+3. Client fetches full messages from Redis cache or Cassandra if needed
+
+## 5. Database Design
 
 ### Selection Reasoning
 
@@ -118,6 +272,7 @@ Recent message cache          = 10M convos × 100 msgs × 100B ≈ 100GB
 | joined_at | TIMESTAMP |
 
 ### Cassandra — messages_by_conversation
+
 Partition key: `conversation_id` ("userId1_userId2", sorted), Clustering: `message_id DESC`
 
 | Field | Type |
@@ -132,6 +287,7 @@ Partition key: `conversation_id` ("userId1_userId2", sorted), Clustering: `messa
 | created_at | TIMESTAMP |
 
 ### Cassandra — messages_by_group
+
 Partition key: `group_id`, Clustering: `message_id DESC`
 
 | Field | Type |
@@ -153,95 +309,10 @@ Partition key: `group_id`, Clustering: `message_id DESC`
 | `chat:{convId}:recent` | List | last 100 messages | 3600s |
 | `session:{sessionId}` | String | `{userId, deviceId}` | 86400s |
 
-## 5. Key Flows
-
-### 5.1 Auth — Registration & Login
-
-**Register:**
-1. Client → API Gateway → User Service
-2. Validate input, hash password (bcrypt)
-3. Write to PostgreSQL
-4. Return JWT token
-
-**Login:**
-1. Validate credentials against PostgreSQL
-2. Generate JWT (1hr expiry) + refresh token
-3. Store session in Redis with TTL
-4. Return tokens to client
-
-**Every request:** API Gateway validates JWT signature + expiry + Redis session existence
-
-### 5.2 WebSocket Connection
-
-1. Client connects to WebSocket Gateway with JWT in header
-2. Gateway validates token, routes to Chat Service via consistent hashing on userId
-3. Chat Service registers: `SET ws:user:{userId} {connId, serverId}` with 300s TTL
-4. Adds to `online:users` set
-5. Heartbeat: client pings every 30s → server pongs + refreshes TTL
-6. On disconnect: remove from registry, remove from online set, update last seen
-
-### 5.3 One-on-One Message Flow
-
-```
-Sender → Chat Service → Redis Stream → Message Service → Cassandra
-                                                       → Redis cache
-                                                       → Elasticsearch
-                     ↓
-              Check ws:user:{receiverId} in Redis
-                     ↓
-         Online → route to receiver's Chat Service → WebSocket delivery
-         Offline → Notification Service → FCM/APNs
-```
-
-1. Client sends message via WebSocket with client-generated `messageId`
-2. Chat Service publishes to Redis Stream
-3. Message Service consumes, writes to Cassandra (idempotent on `messageId`)
-4. Message Service updates Redis recent cache and queues Elasticsearch index
-5. Chat Service looks up receiver's connection in Redis
-6. If online: forwards to correct Chat Service instance → delivers via WebSocket
-7. If offline: Notification Service sends push notification
-8. On delivery: receiver ACKs → status updated to `delivered`
-9. On open: client sends read receipt → status updated to `read` → sender notified
-
-### 5.4 Group Message Flow
-
-1. Chat Service validates sender is group member (cached in Redis, fallback to PostgreSQL)
-2. Publishes to Redis Stream with `groupId`
-3. Message Service persists to `messages_by_group`
-4. Fetches member list, delivers to all online members via their Chat Service instances
-5. Offline members get push notifications
-6. For large groups (1000+): use Redis Pub/Sub channel per group — publish once, all subscribed Chat Service instances deliver
-
-### 5.5 Media Upload Flow
-
-1. Client requests pre-signed S3 URL from Media Upload Service
-2. Client uploads directly to S3 (bypasses app servers)
-3. S3 triggers async post-processing (compression, thumbnail)
-4. Client sends message with returned S3 URL through normal message flow
-5. CDN serves media to recipients
-
-### 5.6 Message Search Flow
-
-1. Client sends search query → API Gateway → Search Service
-2. Elasticsearch query scoped to userId/groupId with text match
-3. Returns message snippets + IDs
-4. Client fetches full messages from Redis cache or Cassandra if needed
-
-### 5.7 Presence & Typing
-
-**Online/Last Seen:**
-- Online set in Redis updated on connect/disconnect
-- Last seen written to Redis on disconnect, flushed to PostgreSQL every 5 min
-
-**Typing Indicator:**
-- Client sends `typing` event via WebSocket
-- Chat Service broadcasts to conversation partner(s)
-- Not persisted, expires after 5s of inactivity
-
 ## 6. Key Interview Concepts
 
 ### WebSocket vs HTTP Polling
-WebSocket gives full-duplex, persistent connection — server pushes instantly. Polling wastes bandwidth asking "any messages?" every N seconds. Trade-off: WebSocket holds memory per connection, but for chat it's worth it.
+WebSocket gives full-duplex persistent connection — server pushes instantly. Polling wastes bandwidth asking "any messages?" every N seconds. Trade-off: WebSocket holds memory per connection, but for chat it's worth it.
 
 ### Message Ordering
 Use TIMEUUID as message ID in Cassandra — embeds timestamp + uniqueness. Cassandra clusters by it descending. Client sorts by timestamp on render. For near-simultaneous messages, last-write-wins is acceptable.
@@ -270,9 +341,6 @@ Three levels: client local storage → Redis (last 100 msgs, TTL 1hr) → Cassan
 ### CAP Trade-off
 Chat favors Availability over strong Consistency. Cassandra with QUORUM writes + ONE reads gives good balance — messages won't be lost, and slight staleness on reads is acceptable.
 
-### Circuit Breaker
-If Cassandra is slow, Message Service opens circuit after N failures, fails fast, and returns error to Chat Service. Prevents cascading overload. Half-opens after 30s to probe recovery.
-
 ## 7. Failure Scenarios
 
 ### WebSocket Connection Drop
@@ -281,12 +349,11 @@ If Cassandra is slow, Message Service opens circuit after N failures, fails fast
 
 ### Message Service Crash
 - Detection: no ACK within 5s
-- Recovery: Redis Stream retains unacknowledged messages, another instance picks up and processes; `messageId` idempotency prevents duplicates
+- Recovery: Redis Stream retains unacknowledged messages, another instance picks up; `messageId` idempotency prevents duplicates
 
 ### Cassandra Node Failure
-- Replication factor = 3, QUORUM writes mean 2/3 nodes must ack
-- Remaining replicas serve reads/writes
-- Hinted handoff stores writes for the failed node, replays when it recovers
+- RF=3, QUORUM writes mean 2/3 nodes must ack
+- Hinted handoff stores writes for the failed node, replays on recovery
 - Multi-datacenter replication for regional failures
 
 ### Redis Failure
@@ -297,22 +364,12 @@ If Cassandra is slow, Message Service opens circuit after N failures, fails fast
 ### Elasticsearch Failure
 - Impact: search unavailable only (non-critical path)
 - Recovery: graceful degradation — show "search unavailable"; index writes queued and replayed on recovery
-- Message delivery is completely unaffected
+- Message delivery completely unaffected
 
 ### S3 / Media Failure
 - Recovery: retry with backoff, fallback to secondary region; message sent as text-only with pending media indicator
-
-### Cascading Failure
-- Circuit breaker per service dependency
-- Bulkhead: separate thread pools for critical (messaging) vs non-critical (search, media) paths
-- Rate limiting and backpressure prevent upstream overload
 
 ### DDoS
 - Rate limiting at API Gateway (per IP + per user)
 - DDoS protection at edge (Cloudflare / AWS Shield)
 - Auto-scaling absorbs legitimate traffic spikes
-
-### Data Loss
-- Cassandra RF=3 + daily snapshots to S3
-- Soft deletes (mark deleted, purge async)
-- Write-ahead log replay for point-in-time recovery

@@ -3,9 +3,6 @@
 ## System Overview
 A multi-tenant SaaS platform architecture where multiple customers (tenants) share the same infrastructure while having isolated data, configurations, and experiences — covering the three tenancy models, data isolation strategies, and operational concerns.
 
-## Architecture Diagram
-#### (To be inserted)
-
 ## 1. Requirements
 
 ### Functional Requirements
@@ -15,7 +12,6 @@ A multi-tenant SaaS platform architecture where multiple customers (tenants) sha
 - Tenant-specific feature flags and plan limits
 - Usage metering and billing per tenant
 - Admin portal for tenant management
-- Tenant-specific SLAs
 
 ### Non-Functional Requirements
 - Isolation: one tenant's data must never be accessible to another
@@ -27,96 +23,160 @@ A multi-tenant SaaS platform architecture where multiple customers (tenants) sha
 ## 2. Tenancy Models
 
 ### Model 1 — Silo (Dedicated per Tenant)
-Each tenant gets their own dedicated infrastructure (DB, compute, storage).
+Each tenant gets dedicated infrastructure (DB, compute, storage).
 
-```
-Tenant A: [App Server A] → [DB A]
-Tenant B: [App Server B] → [DB B]
-Tenant C: [App Server C] → [DB C]
-```
-
-**Pros:**
-- Maximum isolation — no noisy neighbor
-- Easy compliance (data residency, GDPR deletion)
-- Tenant-specific scaling
-- Simple data migration and backup per tenant
-
-**Cons:**
-- High cost — N tenants = N databases
-- Operational overhead — manage N separate environments
-- Resource waste — small tenants have underutilized dedicated infra
-
-**Best for:** Enterprise/large tenants with strict compliance requirements
+Pros: maximum isolation, easy compliance, tenant-specific scaling
+Cons: high cost, operational overhead, resource waste for small tenants
+Best for: enterprise/large tenants with strict compliance
 
 ### Model 2 — Pool (Shared Everything)
 All tenants share the same DB, differentiated by `tenant_id` column.
 
-```
-All Tenants → [Shared App Servers] → [Shared DB with tenant_id column]
-```
-
-**Pros:**
-- Low cost — one DB for all tenants
-- Easy to operate — single environment
-- Efficient resource utilization
-
-**Cons:**
-- Noisy neighbor — one tenant's heavy query affects others
-- Harder compliance — GDPR deletion requires deleting rows across many tables
-- Security risk — a bug could expose cross-tenant data
-- Harder to scale individual tenants
-
-**Best for:** SMB/startup tenants with low compliance requirements
+Pros: low cost, easy to operate, efficient resource utilization
+Cons: noisy neighbor, harder GDPR deletion, cross-tenant leak risk
+Best for: SMB/startup tenants with low compliance requirements
 
 ### Model 3 — Bridge (Shared Compute, Isolated DB)
-Shared application servers but separate database per tenant (or schema per tenant).
+Shared application servers but separate DB per tenant (or schema per tenant).
 
+Pros: balance of cost and isolation, easier compliance than pool
+Cons: complex connection pooling, schema migrations across all tenant DBs
+Best for: mid-market tenants; most common SaaS architecture
+
+## 3. Architecture Diagram
+
+### Components
+
+| Component | Role |
+|---|---|
+| API Gateway | Auth, rate limiting per tenant, routing; extracts tenantId from JWT or subdomain |
+| Tenant Service | Tenant CRUD, provisioning, plan management, feature flags |
+| Auth Service | Multi-tenant auth; JWT contains tenantId + userId |
+| Application Services | Business logic; always scoped to tenantId; never cross-tenant queries |
+| Tenant Config Service | Per-tenant config, feature flags; cached in Redis |
+| Usage Metering Service | Tracks API calls, storage, users per tenant; feeds billing |
+| Billing Service | Subscription management, invoice generation, payment processing |
+| Tenant DB Router | Routes DB connections to correct tenant DB/schema (Bridge model) |
+| Control Plane DB (PostgreSQL) | Tenant registry, plans, billing, config — shared across all tenants |
+| Redis | Tenant config cache, rate limiting per tenant, session store |
+| Kafka | Usage events, billing events, async operations |
+
+### Overview
+
+```mermaid
+flowchart LR
+    tenantA["Tenant A<br/>acme.saas.com"]
+    tenantB["Tenant B<br/>beta.saas.com"]
+    apigw["API Gateway<br/>extract tenantId<br/>rate limit per tenant"]
+
+    authSvc["Auth Service<br/>JWT with tenantId"]
+    appSvcs["Application Services<br/>always scoped to tenantId"]
+    configSvc["Tenant Config Service"]
+    meteringSvc["Usage Metering Service"]
+    billingSvc["Billing Service"]
+    dbRouter["Tenant DB Router<br/>Bridge model"]
+
+    controlDB[("Control Plane DB<br/>PostgreSQL<br/>tenants · plans · billing")]
+    redis[("Redis<br/>config cache · rate limits")]
+    kafka[("Kafka<br/>usage events")]
+    tenantDBs[("Tenant DBs<br/>DB per tenant<br/>Bridge model")]
+
+    tenantA --> apigw
+    tenantB --> apigw
+    apigw --> authSvc
+    apigw --> appSvcs
+    authSvc --> controlDB
+    authSvc --> redis
+
+    appSvcs --> configSvc
+    appSvcs --> dbRouter
+    configSvc --> redis
+    configSvc --> controlDB
+    dbRouter --> tenantDBs
+    appSvcs -->|"usage events"| kafka
+    kafka --> meteringSvc
+    meteringSvc --> controlDB
+    meteringSvc --> billingSvc
 ```
-All Tenants → [Shared App Servers] → [DB per tenant or schema per tenant]
+
+## 4. Key Flows
+
+### 4.1 Tenant Onboarding
+
+```mermaid
+flowchart LR
+    customer["New Customer"] -->|"sign up"| tenantSvc["Tenant Service"]
+    tenantSvc -->|"create tenant record"| controlDB[("Control Plane DB")]
+    tenantSvc -->|"provision based on plan"| provision["Provisioning"]
+    provision -->|"Pool: create schema"| sharedDB[("Shared DB")]
+    provision -->|"Bridge: provision DB instance"| dedicatedDB[("Dedicated DB")]
+    provision -->|"Silo: provision cluster"| cluster[("Dedicated Cluster")]
+    tenantSvc -->|"init config with plan defaults"| redis[("Redis")]
 ```
 
-**Pros:**
-- Balance of cost and isolation
-- Data isolation without dedicated compute
-- Easier compliance than pool model
-- Can scale DB independently per tenant
+1. Create tenant record in Control Plane DB
+2. Provision based on plan: Free/Starter (Pool schema) → Pro (Bridge DB) → Enterprise (Silo cluster)
+3. Create default admin user; send welcome email
 
-**Cons:**
-- More complex connection pooling (N databases)
-- Schema migrations must run across all tenant DBs
-- More expensive than pool model
+### 4.2 Request Routing & Tenant Identification
 
-**Best for:** Mid-market tenants; most common SaaS architecture
+```mermaid
+flowchart LR
+    request["Request<br/>acme.saas.com"] --> apigw["API Gateway"]
+    apigw -->|"extract tenantId from subdomain"| apigw
+    apigw -->|"validate tenant active"| redis[("Redis<br/>tenant config cache")]
+    redis -.->|"miss"| controlDB[("Control Plane DB")]
+    apigw -->|"INCR tenant:rate:{tenantId}"| redis
+    apigw -->|"inject tenantId into context"| appSvcs["Application Services"]
+```
 
-## 3. Core Components
+Every request scoped to a tenant via subdomain (`acme.saas.com`), JWT (`{tenantId, userId}`), or API key.
 
-**API Gateway** — Auth, rate limiting per tenant, routing; extracts `tenantId` from JWT or subdomain
+### 4.3 Data Access with Tenant Isolation
 
-**Tenant Service** — Tenant CRUD, provisioning, plan management, feature flags
+Pool model — always include tenant_id:
+```sql
+-- CORRECT
+SELECT * FROM users WHERE tenant_id = ? AND user_id = ?
+-- NEVER (cross-tenant leak risk)
+SELECT * FROM users WHERE user_id = ?
+```
 
-**Auth Service** — Multi-tenant auth; JWT contains `tenantId` + `userId`; validates tenant is active
+Bridge model — DB Router connects to tenant-specific DB; no tenant_id filter needed in queries.
 
-**Application Services** — Business logic services; always scoped to `tenantId`; never cross-tenant queries
+### 4.4 Feature Flags & Plan Limits
 
-**Tenant Config Service** — Per-tenant configuration, customization, feature flags; cached in Redis
+```mermaid
+flowchart LR
+    request["Request"] --> configSvc["Tenant Config Service"]
+    configSvc -->|"GET tenant:config:{tenantId}"| redis[("Redis TTL 5min")]
+    redis -.->|"miss"| controlDB[("Control Plane DB")]
+    configSvc -->|"check feature flag"| configSvc
+    configSvc -->|"check plan limit"| configSvc
+    configSvc -->|"limit exceeded: 429"| request
+```
 
-**Usage Metering Service** — Tracks API calls, storage, users per tenant; feeds billing
+### 4.5 Usage Metering & Billing
 
-**Billing Service** — Subscription management, invoice generation, payment processing
+```mermaid
+flowchart LR
+    appSvcs["Application Services"] -->|"usage event"| kafka[("Kafka")]
+    kafka --> meteringSvc["Usage Metering Service<br/>aggregate per tenant per day"]
+    meteringSvc --> controlDB[("Control Plane DB<br/>usage_metrics")]
+    billingSvc["Billing Service"] -->|"end of period"| controlDB
+    billingSvc -->|"generate invoice"| payGw["Payment Gateway"]
+```
 
-**Notification Service** — Tenant-scoped notifications; respects tenant communication preferences
+### 4.6 Schema Migrations (Bridge/Pool)
 
-**Tenant DB Router** — Routes DB connections to correct tenant DB/schema (Bridge model)
+1. Migration Runner fetches all active tenant DB connections from Control Plane DB
+2. Runs migration on each tenant DB sequentially or in parallel batches
+3. Tracks migration status per tenant
+4. On failure: mark tenant as migration-failed, alert ops, retry
 
-**Control Plane DB (PostgreSQL)** — Tenant registry, plans, billing, config — shared across all tenants
+Zero-downtime: expand-contract pattern — add new column (nullable), backfill, make required, drop old column.
 
-**Tenant Data DB** — Per-tenant data (Bridge/Silo) or shared with tenant_id (Pool)
-
-**Redis** — Tenant config cache, rate limiting per tenant, session store
-
-**Kafka** — Usage events, billing events, async operations
-
-## 4. Database Design
+## 5. Database Design
 
 ### Control Plane — tenants
 
@@ -152,12 +212,6 @@ All Tenants → [Shared App Servers] → [DB per tenant or schema per tenant]
 | period | DATE |
 | updated_at | TIMESTAMP |
 
-### Tenant Data DB (Bridge model — per tenant schema)
-
-Each tenant gets their own schema: `tenant_{tenantId}.users`, `tenant_{tenantId}.data`, etc.
-
-Pool model: every table has `tenant_id` column as first column in composite PK and all indexes.
-
 ### Redis Keys
 
 | Key Pattern | Type | Value | TTL |
@@ -166,119 +220,25 @@ Pool model: every table has `tenant_id` column as first column in composite PK a
 | `tenant:rate:{tenantId}` | Counter | API calls in window | 60s |
 | `session:{tenantId}:{sessionId}` | String | userId | 86400s |
 
-## 5. Key Flows
-
-### 5.1 Tenant Onboarding
-
-1. New customer signs up → Tenant Service
-2. Create tenant record in Control Plane DB
-3. Provision tenant infrastructure based on plan:
-   - Free/Starter (Pool): create schema in shared DB, seed with default data
-   - Pro (Bridge): provision dedicated DB instance, run schema migrations
-   - Enterprise (Silo): provision dedicated cluster, configure VPC, custom domain
-4. Create default admin user for tenant
-5. Send welcome email with setup instructions
-6. Tenant config initialized with plan defaults
-
-### 5.2 Request Routing & Tenant Identification
-
-Every request must be scoped to a tenant:
-
-**Subdomain-based:** `acme.saas.com` → `tenantId = acme`
-**JWT-based:** JWT contains `{tenantId, userId, role}`
-**API key:** API key maps to `tenantId` in Control Plane DB
-
-1. Request arrives at API Gateway
-2. Extract `tenantId` from subdomain / JWT / API key
-3. Validate tenant is active (Redis cache → Control Plane DB)
-4. Apply tenant-specific rate limits: `INCR tenant:rate:{tenantId}` in Redis
-5. Inject `tenantId` into request context
-6. All downstream services use `tenantId` for data access
-
-### 5.3 Data Access with Tenant Isolation
-
-**Pool model:**
-```sql
--- ALWAYS include tenant_id in every query
-SELECT * FROM users WHERE tenant_id = ? AND user_id = ?
--- Never: SELECT * FROM users WHERE user_id = ?  ← cross-tenant leak risk
-```
-
-**Bridge model:**
-```
-DB Router: SELECT db_connection FROM tenants WHERE tenant_id = ?
-Connect to tenant-specific DB
-Execute query without tenant_id filter (DB is already isolated)
-```
-
-**Silo model:**
-```
-Each tenant has dedicated connection pool
-No tenant_id needed in queries
-```
-
-### 5.4 Feature Flags & Plan Limits
-
-1. Request arrives → Tenant Config Service checks `tenant:config:{tenantId}` in Redis
-2. Cache miss: fetch from Control Plane DB, populate Redis (TTL 5min)
-3. Check feature flag: `config.feature_flags.advanced_analytics = true`
-4. Check plan limit: `config.limits.max_users = 100`; current users = 95 → allow
-5. If limit exceeded: return 429 with upgrade prompt
-
-### 5.5 Usage Metering & Billing
-
-1. Every API call publishes usage event to Kafka: `{tenantId, metric: api_call, timestamp}`
-2. Usage Metering Service consumes events, aggregates per tenant per day
-3. Writes to `usage_metrics` table in Control Plane DB
-4. Billing Service reads usage at end of billing period
-5. Generates invoice based on plan + overage
-6. Charges payment method via Payment Gateway
-
-### 5.6 Schema Migrations (Bridge/Pool Model)
-
-Challenge: running migrations across 10K tenant DBs/schemas.
-
-1. New migration created (e.g., add column to `users` table)
-2. Migration Runner fetches all active tenant DB connections
-3. Runs migration on each tenant DB sequentially or in parallel batches
-4. Tracks migration status per tenant in Control Plane DB
-5. On failure: mark tenant as migration-failed, alert ops, retry
-
-**Zero-downtime migrations:**
-- Expand-contract pattern: add new column (nullable), backfill, make required, drop old column
-- Never drop columns in same migration as adding new ones
-
 ## 6. Key Interview Concepts
 
 ### Noisy Neighbor Problem
-In Pool model, one tenant running heavy queries degrades performance for all others. Solutions:
-- Query timeout per tenant
-- Rate limiting at DB level (connection pool limits per tenant)
-- Move heavy tenants to Bridge/Silo model
-- Read replicas for reporting queries
+In Pool model, one tenant's heavy queries degrade all others. Solutions: query timeout per tenant, rate limiting at DB level, move heavy tenants to Bridge/Silo, read replicas for reporting.
 
 ### Cross-Tenant Data Leak Prevention
-The most critical security concern. Solutions:
-- Pool model: row-level security (PostgreSQL RLS) — DB enforces tenant_id filter automatically
+- Pool model: PostgreSQL Row-Level Security (RLS) — DB enforces tenant_id filter automatically
 - All queries must include `tenant_id` in WHERE clause — enforced by ORM/middleware
 - Integration tests that verify cross-tenant isolation
-- Regular security audits
 
 ### GDPR Right to Erasure
-Tenant requests data deletion. Solutions:
 - Silo/Bridge: drop tenant DB/schema — clean and complete
 - Pool: delete all rows with `tenant_id = X` across all tables — complex, must be thorough
-- Soft delete first, hard delete after verification
-- Audit log of deletion for compliance
 
 ### Connection Pooling at Scale
-Bridge model with 10K tenants = 10K DB connections. Solutions:
-- PgBouncer or connection pooler per tenant group
-- Lazy connection: only open connection when tenant is active
-- Connection limits per tenant based on plan
+Bridge model with 10K tenants = 10K DB connections. Solutions: PgBouncer per tenant group, lazy connection (only open when tenant is active), connection limits per tenant based on plan.
 
 ### Tenant Isolation in Caching
-Redis cache must be tenant-scoped. Always prefix keys with `tenantId`. Never cache data that could be served to wrong tenant. Separate Redis instances for enterprise tenants (Silo model).
+Always prefix Redis keys with `tenantId`. Never cache data that could be served to wrong tenant. Separate Redis instances for enterprise tenants (Silo model).
 
 ## 7. Failure Scenarios
 
@@ -288,21 +248,15 @@ Redis cache must be tenant-scoped. Always prefix keys with `tenantId`. Never cac
 - Prevention: per-tenant DB replication; automated failover
 
 ### Shared DB Failure (Pool)
-- Impact: all tenants affected
+- Impact: all tenants affected — main risk of Pool model
 - Recovery: promote replica; all tenants recover together
-- Prevention: high-availability DB cluster; this is the main risk of Pool model
-
-### Migration Failure on Tenant DB
-- Impact: that tenant's DB is in inconsistent state
-- Recovery: rollback migration for that tenant; mark as failed; alert ops
-- Prevention: test migrations on staging tenant first; idempotent migrations
+- Prevention: high-availability DB cluster
 
 ### Noisy Tenant Overloading Shared Resources
-- Detection: latency spikes for other tenants; one tenant consuming disproportionate resources
+- Detection: latency spikes for other tenants
 - Recovery: throttle offending tenant; move to dedicated infrastructure
 - Prevention: per-tenant rate limits; resource quotas; monitoring per tenant
 
 ### Cross-Tenant Data Leak Bug
-- Detection: security audit, penetration test, or customer report
-- Recovery: immediate incident response; identify affected tenants; notify per GDPR requirements
+- Recovery: immediate incident response; identify affected tenants; notify per GDPR
 - Prevention: row-level security; automated cross-tenant isolation tests; code review for all DB queries

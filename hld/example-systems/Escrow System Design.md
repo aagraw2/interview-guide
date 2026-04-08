@@ -3,9 +3,6 @@
 ## System Overview
 An escrow service that holds funds from a buyer until predefined conditions are met, then releases to the seller — used in freelance platforms (Upwork), real estate, marketplace transactions, and M&A deals. Ensures neither party can be defrauded.
 
-## Architecture Diagram
-#### (To be inserted)
-
 ## 1. Requirements
 
 ### Functional Requirements
@@ -48,37 +45,135 @@ Ledger entries      = 500K/day × 300B = 150MB/day
 Audit log           = 500K/day × 500B = 250MB/day
 ```
 
-## 3. Core Components
+## 3. Architecture Diagram
 
-**API Gateway** — Auth, rate limiting, routing
+### Components
 
-**Escrow Service** — Core orchestrator; manages escrow contract lifecycle; enforces state machine transitions
+| Component | Role |
+|---|---|
+| API Gateway | Auth, rate limiting, routing |
+| Escrow Service | Core orchestrator; manages contract lifecycle; enforces state machine |
+| Funding Service | Buyer deposit into escrow; integrates with payment gateway |
+| Release Service | Releases funds to seller on condition fulfillment |
+| Refund Service | Returns funds to buyer on cancellation or dispute resolution |
+| Dispute Service | Manages dispute lifecycle; holds funds during arbitration |
+| Ledger Service | Double-entry bookkeeping; immutable fund movement record |
+| Notification Service | Kafka consumer; notifies parties of state changes |
+| Escrow DB (PostgreSQL) | Contract records, state, conditions, parties |
+| Ledger DB (PostgreSQL) | Immutable double-entry ledger |
+| Audit Log (Cassandra) | Immutable audit trail of every action and state transition |
+| Redis | Contract state cache, idempotency keys, session store |
+| Kafka | State transition events, notification fan-out |
 
-**Funding Service** — Handles buyer deposit into escrow; integrates with payment gateway; credits escrow holding account
+### Overview
 
-**Release Service** — Releases funds to seller on condition fulfillment; integrates with payout system
+```mermaid
+flowchart LR
+    buyer["Buyer"]
+    seller["Seller"]
+    apigw["API Gateway"]
 
-**Refund Service** — Returns funds to buyer on cancellation or dispute resolution in buyer's favor
+    escrowSvc["Escrow Service<br/>state machine orchestrator"]
+    fundingSvc["Funding Service"]
+    releaseSvc["Release Service"]
+    refundSvc["Refund Service"]
+    disputeSvc["Dispute Service"]
+    ledger["Ledger Service<br/>double-entry"]
+    notif["Notification Service"]
 
-**Dispute Service** — Manages dispute lifecycle; holds funds during arbitration; implements arbitrator decision
+    escrowDB[("Escrow DB<br/>PostgreSQL")]
+    ledgerDB[("Ledger DB<br/>PostgreSQL")]
+    auditLog[("Audit Log<br/>Cassandra")]
+    redis[("Redis<br/>idempotency · cache")]
+    kafka[("Kafka")]
+    payGw["Payment Gateway"]
 
-**Condition Service** — Evaluates release conditions (milestone completion, delivery confirmation, timer expiry)
+    buyer --> apigw
+    seller --> apigw
+    apigw --> escrowSvc
 
-**Ledger Service** — Double-entry bookkeeping; immutable record of all fund movements
+    escrowSvc --> fundingSvc
+    escrowSvc --> releaseSvc
+    escrowSvc --> refundSvc
+    escrowSvc --> disputeSvc
+    escrowSvc --> escrowDB
+    escrowSvc --> ledger
+    escrowSvc --> auditLog
+    escrowSvc -->|"events"| kafka
 
-**Notification Service** — Kafka consumer; notifies buyer/seller of state changes, dispute updates
+    fundingSvc --> payGw
+    releaseSvc --> payGw
+    refundSvc --> payGw
+    ledger --> ledgerDB
+    kafka --> notif
+    escrowSvc --> redis
+```
 
-**Escrow DB (PostgreSQL)** — Contract records, state, conditions, parties
+## 4. Key Flows
 
-**Ledger DB (PostgreSQL)** — Immutable double-entry ledger
+### 4.1 Contract Lifecycle (State Machine)
 
-**Audit Log (Cassandra)** — Immutable audit trail of every action and state transition
+```
+CREATED → FUNDED → IN_PROGRESS → COMPLETED
+                              ↘ DISPUTED → resolved → COMPLETED or REFUNDED
+                              ↘ CANCELLED → REFUNDED
+                              ↘ EXPIRED → REFUNDED
+```
 
-**Redis** — Contract state cache, idempotency keys, session store
+Every state transition: validated → written to PostgreSQL atomically with ledger entry → logged to Cassandra audit log → published to Kafka
 
-**Kafka** — State transition events, notification fan-out
+### 4.2 Contract Creation & Funding
 
-## 4. Database Design
+```mermaid
+flowchart LR
+    buyer["Buyer"] -->|"POST /escrow"| escrowSvc["Escrow Service<br/>state=created"]
+    buyer -->|"deposit"| fundingSvc["Funding Service"]
+    fundingSvc --> payGw["Payment Gateway"]
+    payGw -->|"success"| fundingSvc
+    fundingSvc -->|"state=funded<br/>DEBIT buyer<br/>CREDIT escrow_holding"| escrowDB[("Escrow DB +<br/>Ledger DB")]
+    fundingSvc -->|"CONTRACT_FUNDED"| kafka[("Kafka")]
+    kafka --> notif["Notification Service"]
+```
+
+1. Buyer creates contract with `{sellerId, amount, conditions, expiresAt}` → `state = created`
+2. Buyer deposits → Funding Service → payment gateway
+3. On success: `state = funded`, DEBIT buyer_account, CREDIT escrow_holding_account
+4. Seller notified: "Funds secured in escrow, begin work"
+
+### 4.3 Milestone Release
+
+```mermaid
+flowchart LR
+    seller["Seller"] -->|"submit milestone"| escrowSvc["Escrow Service"]
+    buyer["Buyer"] -->|"approve milestone"| escrowSvc
+    escrowSvc -->|"state=completed<br/>DEBIT escrow_holding<br/>CREDIT seller + platform fee"| escrowDB[("Escrow DB +<br/>Ledger DB")]
+    escrowSvc --> payGw["Payment Gateway<br/>bank transfer to seller"]
+    escrowSvc -->|"RELEASED"| kafka[("Kafka")]
+```
+
+1. Seller submits milestone → buyer approves
+2. Release Service: DEBIT escrow_holding, CREDIT seller_account + platform fee
+3. Payout Service initiates bank transfer to seller
+
+### 4.4 Dispute Flow
+
+```mermaid
+flowchart LR
+    party["Buyer or Seller"] -->|"raise dispute"| disputeSvc["Dispute Service<br/>state=disputed<br/>funds frozen"]
+    disputeSvc --> arbitrator["Arbitrator<br/>human or automated"]
+    arbitrator -->|"buyer wins"| refundSvc["Refund Service<br/>CREDIT buyer"]
+    arbitrator -->|"seller wins"| releaseSvc["Release Service<br/>CREDIT seller"]
+    refundSvc --> ledgerDB[("Ledger DB")]
+    releaseSvc --> ledgerDB
+```
+
+Funds remain frozen in escrow_holding during arbitration. Arbitrator decision triggers atomic ledger entry + state transition.
+
+### 4.5 Expiry & Auto-Refund
+
+Scheduled job checks contracts where `expires_at < now AND state IN (funded, in_progress)` → Refund Service initiates refund → `state = refunded`
+
+## 5. Database Design
 
 ### PostgreSQL — escrow_contracts
 
@@ -147,88 +242,30 @@ Audit log           = 500K/day × 500B = 250MB/day
 | to_state | TEXT |
 | details | TEXT (JSON) |
 
-## 5. Key Flows
+### Redis Keys
 
-### 5.1 Escrow Contract Lifecycle (State Machine)
-
-```
-CREATED → FUNDED → IN_PROGRESS → COMPLETED
-                              ↘ DISPUTED → resolved → COMPLETED or REFUNDED
-                              ↘ CANCELLED → REFUNDED
-                              ↘ EXPIRED → REFUNDED
-```
-
-Every state transition is:
-1. Validated (is transition allowed from current state?)
-2. Written to PostgreSQL atomically with ledger entry
-3. Logged to Cassandra audit log
-4. Published to Kafka for notifications
-
-### 5.2 Contract Creation & Funding
-
-1. Buyer creates contract: `POST /escrow` with `{sellerId, amount, conditions, expiresAt}`
-2. Escrow Service validates parties, creates contract (`state = created`)
-3. Buyer initiates deposit → Funding Service → payment gateway
-4. On payment success:
-   - PostgreSQL transaction:
-     - `contract.state = funded`
-     - Ledger: DEBIT buyer_account, CREDIT escrow_holding_account
-   - Publish `CONTRACT_FUNDED` to Kafka
-5. Seller notified: "Funds secured in escrow, begin work"
-
-### 5.3 Milestone Completion & Release
-
-1. Seller completes work, submits milestone: `milestone.status = submitted`
-2. Buyer reviews and approves: `milestone.status = approved`
-3. Release Service triggered:
-   - PostgreSQL transaction:
-     - `milestone.status = released`
-     - `contract.state = completed` (if all milestones done)
-     - Ledger: DEBIT escrow_holding, CREDIT seller_account
-     - Ledger: DEBIT escrow_holding, CREDIT platform_account (fee)
-   - Payout Service initiates bank transfer to seller
-4. Both parties notified
-
-### 5.4 Dispute Flow
-
-1. Either party raises dispute: `POST /escrow/{id}/dispute`
-2. Dispute Service:
-   - `contract.state = disputed` (funds frozen in escrow_holding)
-   - Creates dispute record
-3. Arbitrator assigned (human or automated)
-4. Both parties submit evidence
-5. Arbitrator resolves:
-   - In buyer's favor: Refund Service → DEBIT escrow_holding, CREDIT buyer_account
-   - In seller's favor: Release Service → DEBIT escrow_holding, CREDIT seller_account
-6. Contract state updated to `completed` or `refunded`
-
-### 5.5 Expiry & Auto-Refund
-
-1. Scheduled job checks contracts where `expires_at < now AND state = funded/in_progress`
-2. Refund Service initiates refund to buyer
-3. Contract state → `refunded`
-4. Both parties notified
+| Key Pattern | Type | Value | TTL |
+|---|---|---|---|
+| `idempotency:{key}` | String | contractId | 86400s |
+| `contract:state:{contractId}` | String | current state | 300s |
+| `session:{sessionId}` | String | userId | 86400s |
 
 ## 6. Key Interview Concepts
 
 ### Escrow as a State Machine
-Escrow contract is a strict state machine. Invalid transitions (e.g., `refunded → completed`) are rejected. This prevents race conditions where buyer and seller simultaneously trigger conflicting actions. State transitions are atomic PostgreSQL transactions.
+Invalid transitions (e.g., `refunded → completed`) are rejected. Prevents race conditions where buyer and seller simultaneously trigger conflicting actions. State transitions are atomic PostgreSQL transactions.
 
 ### Segregated Holding Accounts
-Escrow funds are held in a separate holding account (not mixed with platform operating funds). This is a regulatory requirement in many jurisdictions. Ledger tracks exact balance per contract in the holding account.
+Escrow funds held in a separate holding account — not mixed with platform operating funds. Regulatory requirement in many jurisdictions. Ledger tracks exact balance per contract.
 
 ### Preventing Double Release
-Two concurrent release requests for the same contract:
-- PostgreSQL `UPDATE contracts SET state='completed' WHERE state='in_progress'` — only one succeeds
-- Idempotency key on release request
-- Ledger entry creation is atomic with state transition
+PostgreSQL `UPDATE contracts SET state='completed' WHERE state='in_progress'` — only one concurrent request succeeds. Idempotency key on release request. Ledger entry creation is atomic with state transition.
 
 ### Dispute Arbitration
-Automated arbitration: rule-based (e.g., if seller submitted proof of delivery, release to seller). Human arbitration: for complex cases, assign to human arbitrator with SLA. Escalation: if arbitrator doesn't resolve within SLA, escalate to senior arbitrator.
+Automated: rule-based (e.g., seller submitted proof of delivery → release to seller). Human: for complex cases, assign with SLA. Escalation: if no resolution in 7 days, auto-escalate. Funds remain frozen (safe) throughout.
 
 ### Regulatory Compliance
-Escrow services are regulated in many countries. Requirements:
-- Segregated client funds (not mixed with company funds)
+- Segregated client funds
 - Full audit trail (Cassandra immutable log)
 - KYC/AML checks on parties
 - Reporting to financial regulators
@@ -236,7 +273,7 @@ Escrow services are regulated in many countries. Requirements:
 ## 7. Failure Scenarios
 
 ### Payment Gateway Failure During Funding
-- Recovery: idempotency key prevents double charge on retry; contract stays in `created` state until funding confirmed
+- Recovery: idempotency key prevents double charge on retry; contract stays in `created` until funding confirmed
 - Prevention: webhook callback from gateway as confirmation fallback
 
 ### Release Service Crash Mid-Release
@@ -244,7 +281,7 @@ Escrow services are regulated in many countries. Requirements:
 - Prevention: atomic DB transaction for state change + ledger entry
 
 ### Dispute Arbitrator Unavailable
-- Recovery: SLA-based escalation; if no resolution in 7 days, auto-escalate; funds remain frozen (safe)
+- Recovery: SLA-based escalation; funds remain frozen (safe)
 - Prevention: multiple arbitrators; automated rule-based resolution for clear-cut cases
 
 ### PostgreSQL Failure

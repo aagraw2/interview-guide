@@ -3,9 +3,6 @@
 ## System Overview
 A large-scale email sending service (think Gmail SMTP / SendGrid / Amazon SES) that handles transactional emails (OTP, receipts, alerts) and bulk marketing emails — with delivery tracking, bounce handling, spam compliance, and high deliverability.
 
-## Architecture Diagram
-#### (To be inserted)
-
 ## 1. Requirements
 
 ### Functional Requirements
@@ -51,7 +48,55 @@ Templates           = thousands × 50KB = small
 Suppression list    = 100M entries × 100B = 10GB
 ```
 
-## 3. Core Components
+## 3. Architecture Diagram
+
+### Components
+
+| Component | Role |
+|---|---|
+| API Gateway | Auth, rate limiting, routing |
+| Email API Service | Receives send requests; validates; deduplicates; writes to Email DB; publishes to Kafka |
+| Template Service | Manages templates; renders HTML with variable substitution |
+| Suppression Service | Manages suppression list (bounced, unsubscribed, complained) |
+| Priority Router | Routes emails to transactional or marketing queue |
+| Sending Workers | Connect to SMTP servers; manage IP rotation and rate limiting |
+| Bounce Handler | Receives bounce notifications; classifies hard vs soft; updates suppression list |
+| Complaint Handler | Receives FBL spam complaints; adds to suppression list |
+| Delivery Tracker | Tracks open/click events via tracking pixels and link wrapping |
+| Webhook Service | Delivers delivery events to customers |
+| Email DB (Cassandra) | Email records; partition by customerId |
+| Delivery Events DB (Cassandra) | Open, click, bounce, complaint events |
+| Template DB (PostgreSQL) | Email templates |
+| Suppression DB (Redis + PostgreSQL) | Redis for fast lookup; PostgreSQL for persistence |
+| Kafka | Email queues: `transactional-emails`, `marketing-emails`, bounce/complaint events |
+
+### Overview
+
+```mermaid
+flowchart LR
+    app["Application"] -->|"POST /send"| apigw["API Gateway"]
+    apigw --> emailApi["Email API Service<br/>idempotency · suppression check"]
+    emailApi -->|"render"| templateSvc["Template Service"]
+    emailApi -->|"status=queued"| emailDB[("Email DB<br/>Cassandra")]
+    emailApi -->|"publish"| kafka[("Kafka<br/>transactional-emails<br/>marketing-emails")]
+
+    kafka --> priorityRouter["Priority Router"]
+    priorityRouter --> workers["Sending Workers<br/>IP rotation · rate limit"]
+    workers -->|"SMTP"| smtp["Receiving SMTP Server"]
+
+    smtp -->|"bounce"| bounceHandler["Bounce Handler"]
+    smtp -->|"complaint FBL"| complaintHandler["Complaint Handler"]
+    bounceHandler --> suppression[("Suppression DB<br/>Redis + PostgreSQL")]
+    complaintHandler --> suppression
+
+    workers -->|"delivery events"| eventsDB[("Delivery Events DB<br/>Cassandra")]
+    eventsDB --> webhookSvc["Webhook Service"]
+
+    emailApi -->|"check"| suppression
+    emailApi -->|"idempotency"| redis[("Redis")]
+```
+
+## 4. Key Flows
 
 **API Gateway** — Auth, rate limiting, routing for email submission API
 
@@ -87,7 +132,7 @@ Suppression list    = 100M entries × 100B = 10GB
 
 **Kafka** — Email queue (transactional + marketing topics), bounce/complaint events
 
-## 4. Database Design
+## 5. Database Design
 
 ### Selection Reasoning
 
@@ -148,90 +193,62 @@ Partition key: `customer_id`, Clustering: `email_id DESC`
 
 ### 5.1 Transactional Email Send
 
-```
-Application → Email API Service
-                    ↓
-    Idempotency check (Redis)
-    Suppression check (Redis cache → PostgreSQL)
-                    ↓
-    Render template (Template Service)
-                    ↓
-    Write to Cassandra (status=queued)
-    Publish to Kafka: transactional-emails topic (high priority)
-                    ↓
-    Sending Worker consumes → SMTP send
-                    ↓
-    Update status = sent
-    Delivery events tracked via tracking pixel
+```mermaid
+flowchart LR
+    app["Application"] -->|"POST /send<br/>idempotencyKey"| emailApi["Email API Service"]
+    emailApi -->|"SET NX EX 86400"| redis[("Redis<br/>idempotency")]
+    emailApi -->|"GET suppress:{hash}"| suppression[("Suppression DB<br/>Redis")]
+    emailApi --> templateSvc["Template Service<br/>render HTML"]
+    emailApi -->|"status=queued"| emailDB[("Email DB<br/>Cassandra")]
+    emailApi -->|"high priority"| kafka[("Kafka<br/>transactional-emails")]
+    kafka --> workers["Sending Workers"]
+    workers -->|"SMTP send"| smtp["Receiving Server"]
 ```
 
-1. Application calls `POST /send` with `{to, templateId, variables, idempotencyKey}`
-2. Idempotency check: `SET idempotency:{key} 1 NX EX 86400` — if exists, return cached emailId
-3. Suppression check: `GET suppress:{hash(toAddress)}` in Redis — if suppressed, skip send, return `suppressed` status
-4. Template Service renders HTML with variables
-5. Write email record to Cassandra (`status = queued`)
-6. Publish to Kafka `transactional-emails` topic (high priority, processed first)
-7. Sending Worker picks up, connects to SMTP server, sends email
-8. Update `status = sent`
+1. Idempotency check: `SET idempotency:{key} 1 NX EX 86400` — if exists, return cached emailId
+2. Suppression check: `GET suppress:{hash(toAddress)}` — if suppressed, skip send
+3. Template Service renders HTML with variables
+4. Write to Cassandra (`status = queued`) → publish to `transactional-emails` topic
+5. Sending Worker connects to SMTP server, sends email, updates `status = sent`
 
 ### 5.2 Bulk Marketing Campaign
 
-1. Customer creates campaign: `{segment, templateId, schedule}`
-2. Campaign Service segments recipients (query customer's contact list)
-3. At scheduled time: publish recipient batches to Kafka `marketing-emails` topic
-4. Priority Router processes marketing emails after transactional (lower priority)
-5. Rate limiting: max N emails/sec per customer (avoid IP reputation damage)
-6. Sending Workers process in parallel across multiple IPs
+```mermaid
+flowchart LR
+    campaign["Campaign Service<br/>segment recipients"] -->|"batches"| kafka[("Kafka<br/>marketing-emails")]
+    kafka --> priorityRouter["Priority Router<br/>lower priority than transactional"]
+    priorityRouter --> workers["Sending Workers<br/>rate limited per customer"]
+    workers -->|"parallel across IPs"| smtp["Receiving Servers"]
+```
 
-**Why separate topics:**
-Transactional emails (OTP, receipts) must be delivered immediately. Marketing emails can wait. Separate Kafka topics ensure transactional workers always have capacity regardless of marketing volume.
+Separate Kafka topics ensure transactional workers always have capacity regardless of marketing volume.
 
-### 5.3 Bounce Handling
+### 5.3 Bounce & Complaint Handling
 
-**Hard bounce** (invalid email address — permanent failure):
-1. Receiving mail server returns 5xx error
-2. Bounce Handler receives notification
-3. Adds email address to suppression list (PostgreSQL + Redis)
-4. Updates email record `status = bounced`
-5. Notifies customer via webhook
+```mermaid
+flowchart LR
+    smtp["Receiving Server"] -->|"5xx hard bounce"| bounceHandler["Bounce Handler"]
+    smtp -->|"4xx soft bounce"| bounceHandler
+    smtp -->|"FBL complaint"| complaintHandler["Complaint Handler"]
+    bounceHandler -->|"add to suppression"| suppression[("Suppression DB<br/>PostgreSQL + Redis")]
+    complaintHandler -->|"add to suppression"| suppression
+    bounceHandler -->|"status=bounced"| emailDB[("Email DB<br/>Cassandra")]
+    bounceHandler -->|"notify customer"| webhookSvc["Webhook Service"]
+```
 
-**Soft bounce** (mailbox full, server temporarily unavailable):
-1. Receiving server returns 4xx error
-2. Retry with exponential backoff (1hr, 4hr, 24hr)
-3. After 3 retries: treat as hard bounce, add to suppression
+- Hard bounce (5xx): add to suppression immediately
+- Soft bounce (4xx): retry with backoff (1hr, 4hr, 24hr); after 3 retries → treat as hard bounce
+- Complaint rate > 0.5%: pause sending for that customer
 
-**Why suppression matters:**
-Continuing to send to bounced addresses damages IP reputation → emails go to spam → deliverability drops for all customers.
+### 5.4 Delivery Tracking
 
-### 5.4 Spam Complaint Handling
+Open tracking: `<img src="https://track.email.com/open/{emailId}">` — browser loads pixel on open
 
-1. Recipient marks email as spam in Gmail/Outlook
-2. ISP sends complaint via Feedback Loop (FBL) to Bounce Handler
-3. Complaint Handler adds email to suppression list
-4. Updates delivery event: `event_type = complained`
-5. If complaint rate > 0.1%: alert customer; if > 0.5%: pause sending for that customer
+Click tracking: wrap links as `https://track.email.com/click/{emailId}/{linkHash}` → redirect to original URL
 
-### 5.5 Delivery Tracking
+Both events written to Delivery Events DB (Cassandra) and delivered to customers via Webhook Service.
 
-**Open tracking:**
-- Embed 1×1 pixel image in email: `<img src="https://track.email.com/open/{emailId}">`
-- When recipient opens email, browser loads pixel
-- Delivery Tracker records open event
-
-**Click tracking:**
-- Wrap all links: `https://track.email.com/click/{emailId}/{linkHash}` → redirect to original URL
-- Delivery Tracker records click event, redirects user
-
-**Privacy note:** Apple Mail Privacy Protection (iOS 15+) pre-fetches tracking pixels → inflated open rates. Open tracking is approximate; click tracking is more reliable.
-
-### 5.6 IP Reputation Management
-
-Sending from IPs with bad reputation → emails go to spam. Management:
-- Dedicated IPs per customer (enterprise) or shared IPs (SMB)
-- IP warming: gradually increase volume on new IPs (start 100/day, double weekly)
-- Monitor bounce rate, complaint rate per IP
-- Rotate IPs if reputation drops
-- Separate IPs for transactional vs marketing (protect transactional reputation)
+Note: Apple Mail Privacy Protection (iOS 15+) pre-fetches tracking pixels → inflated open rates. Click tracking is more reliable.
 
 ## 6. Key Interview Concepts
 

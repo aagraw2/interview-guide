@@ -3,9 +3,6 @@
 ## System Overview
 A real-time collaborative document editor (think Google Docs) where multiple users simultaneously edit the same document, with changes merged conflict-free via Operational Transformation and persisted durably through an event-sourced op log.
 
-## Architecture Diagram
-#### (To be inserted)
-
 ## 1. Requirements
 
 ### Functional Requirements
@@ -32,7 +29,6 @@ A real-time collaborative document editor (think Google Docs) where multiple use
 - Each session generates ~20 ops/min while active
 - Average op size: 50 bytes
 - Average document size: 100KB
-- Snapshot on every manual save + autosave every 10–20s
 
 ### Traffic
 ```
@@ -56,45 +52,171 @@ Hot doc canonical copies = top 1M active docs × 100KB = 100GB
 Active session metadata  = 10M × 500B = 5GB
 ```
 
-## 3. Core Components
+## 3. Architecture Diagram
 
-**LB + API Gateway** — SSL termination, JWT validation, rate limiting, routing for all HTTP requests
+### Components
 
-**WebSocket LB + Gateway** — Persistent WebSocket connections, auth, rate limiting, consistent hashing on `docId` to Document Editor Service
+| Component | Role |
+|---|---|
+| LB + API Gateway | SSL termination, JWT validation, rate limiting, HTTP routing |
+| WebSocket LB + Gateway | Persistent WebSocket connections; consistent hashing on docId |
+| Document Metadata Service | Create/read/update document metadata; publishes to Kafka |
+| Document Editor Service | Core real-time OT engine; applies ops, updates Redis, broadcasts to collaborators |
+| Metadata Consumer | Kafka consumer; persists metadata changes to VersionDB (Cassandra) |
+| Operation Consumer | Kafka consumer; persists operations to Operations DB (Cassandra) |
+| Reconciliation Service | Replays ops from Cassandra for version restore and recovery |
+| Redis | Canonical document copy (live working state), session registry |
+| Kafka | Async event bus for ops and metadata events |
+| S3 | Document snapshots (versioned saves) |
+| Cassandra (Ops DB) | Append-only op log; partition by docId |
+| Cassandra (VersionDB) | Document metadata and version records |
 
-**Document Metadata Service** — Handles all HTTP requests to create/read/update document metadata; publishes metadata change events to Kafka
+### Overview
 
-**Document Editor Service** — Core real-time engine; receives ops via WebSocket, applies OT, updates Redis canonical copy, publishes ops to Kafka, broadcasts to collaborators
+```mermaid
+flowchart LR
+    client["Client"]
+    apigw["LB & API Gateway"]
+    wsgw["WebSocket Gateway<br/>consistent hash on docId"]
 
-**Metadata Consumer** — Kafka consumer; persists document metadata changes to Cassandra (VersionDB)
+    metaSvc["Document Metadata Svc<br/>CRUD metadata"]
+    editorSvc["Document Editor Svc<br/>OT engine · broadcast ops"]
+    reconcile["Reconciliation Svc<br/>replay ops for restore"]
 
-**Operation Consumer Service** — Kafka consumer; persists operations to Cassandra (Operations DB)
+    kafka[("Kafka<br/>ops · metadata events")]
+    metaConsumer["Metadata Consumer"]
+    opConsumer["Operation Consumer"]
 
-**Reconciliation Service (Replay)** — Reconstructs the final document state by replaying ops from Cassandra; used for version restore and recovery
+    redis[("Redis<br/>canonical copy · sessions")]
+    s3[("S3<br/>snapshots")]
+    opsDB[("Cassandra<br/>Operations DB<br/>op log by docId")]
+    versionDB[("Cassandra<br/>VersionDB<br/>metadata · versions")]
 
-**Redis (Canonical Copy)** — In-memory authoritative document state with TTL; the live working copy during active editing
+    client -->|"REST"| apigw
+    client -->|"WebSocket"| wsgw
+    apigw --> metaSvc
+    wsgw --> editorSvc
 
-**Kafka** — Async event bus decoupling the editor from persistence; two logical streams: metadata events and operation events
+    metaSvc --> versionDB
+    metaSvc -->|"metadata events"| kafka
 
-**S3** — Stores document snapshots (initial state and versioned saves)
+    editorSvc --> redis
+    editorSvc -->|"publish ops"| kafka
+    editorSvc -->|"broadcast"| client
 
-**Cassandra — Operations DB** — Append-only op log; partition by `docId`, cluster by timestamp
+    kafka --> metaConsumer
+    kafka --> opConsumer
+    metaConsumer --> versionDB
+    opConsumer --> opsDB
 
-**Cassandra — VersionDB** — Document metadata and version records
+    reconcile --> s3
+    reconcile --> opsDB
 
-**CDN** — Serves static assets and document media
+    editorSvc -.->|"snapshot"| s3
+```
 
-## 4. Database Design
+## 4. Key Flows
+
+### 4.1 Auth
+
+```mermaid
+flowchart LR
+    client["Client"] -->|"register / login"| apigw["API Gateway"]
+    apigw --> userSvc["User Service"]
+    userSvc --> db[("User DB")]
+    userSvc -->|"session"| redis[("Redis")]
+    userSvc -->|"JWT"| client
+```
+
+1. Register: validate → hash password → write to DB → return JWT
+2. Login: validate credentials → JWT (1hr) + refresh token → session in Redis
+3. API Gateway validates JWT on every HTTP and WebSocket request
+
+### 4.2 Document Create & Open
+
+```mermaid
+flowchart LR
+    client["Client"] -->|"POST /docs"| apigw["API Gateway"]
+    apigw --> metaSvc["Document Metadata Svc"]
+    metaSvc -->|"write metadata"| versionDB[("Cassandra VersionDB")]
+    metaSvc -->|"write empty snapshot"| s3[("S3")]
+    metaSvc -->|"return docId"| client
+
+    client -->|"WS connect + docId"| wsgw["WebSocket Gateway"]
+    wsgw --> editorSvc["Document Editor Svc"]
+    editorSvc -->|"load canonical copy"| redis[("Redis")]
+    editorSvc -.->|"cache miss: load snapshot"| s3
+    editorSvc -.->|"replay ops since snapshot"| opsDB[("Cassandra Ops DB")]
+```
+
+1. Create: write metadata to VersionDB → write empty snapshot to S3 → return docId
+2. Open: fetch metadata + snapshot URL from VersionDB → download from S3 via CDN
+3. Connect WebSocket → Document Editor Service loads canonical copy from Redis (or reconstructs from S3 + Cassandra on cache miss)
+
+### 4.3 Real-Time Collaborative Editing (OT)
+
+```mermaid
+flowchart LR
+    userA["User A"] -->|"op + baseVersion"| editorSvc["Document Editor Svc<br/>acquire Redis lock on docId"]
+    editorSvc -->|"fetch current version"| redis[("Redis<br/>canonical copy")]
+    editorSvc -->|"transform op if needed<br/>apply + increment version"| redis
+    editorSvc -->|"publish op"| kafka[("Kafka")]
+    editorSvc -->|"broadcast transformed op"| userB["User B"]
+    kafka --> opConsumer["Operation Consumer"]
+    opConsumer --> opsDB[("Cassandra Ops DB")]
+```
+
+1. User types → client sends op: `{docId, event, baseVersion}`
+2. Document Editor Service acquires Redis lock on docId (SETNX)
+3. If `baseVersion < currentVersion`: transform op against intermediate ops
+4. Apply transformed op to Redis canonical copy, increment version
+5. Release lock → publish op to Kafka → broadcast to all collaborators
+6. Operation Consumer persists op to Cassandra async
+
+### 4.4 Snapshotting & Versioning
+
+```mermaid
+flowchart LR
+    trigger["Autosave / Manual Save"] --> editorSvc["Document Editor Svc"]
+    editorSvc -->|"read canonical copy"| redis[("Redis")]
+    editorSvc -->|"write snapshot"| s3[("S3<br/>snapshots/{docId}/{versionId}")]
+    editorSvc -->|"publish metadata event"| kafka[("Kafka")]
+    kafka --> metaConsumer["Metadata Consumer"]
+    metaConsumer -->|"write version record"| versionDB[("Cassandra VersionDB")]
+```
+
+1. Autosave (every 10–20s) or manual save triggers snapshot
+2. Read canonical copy from Redis → write to S3
+3. Publish metadata event → Metadata Consumer writes version record to VersionDB
+
+### 4.5 Version Restore
+
+```mermaid
+flowchart LR
+    client["Client"] -->|"list versions"| metaSvc["Document Metadata Svc"]
+    metaSvc --> versionDB[("Cassandra VersionDB")]
+    client -->|"restore version V"| reconcile["Reconciliation Svc"]
+    reconcile -->|"load snapshot at V"| s3[("S3")]
+    reconcile -->|"fetch ops after snapshot"| opsDB[("Cassandra Ops DB")]
+    reconcile -->|"replay ops → reconstructed state"| client
+```
+
+1. User selects version V → Reconciliation Service loads snapshot from S3
+2. Fetches all ops after that snapshot's timestamp from Cassandra
+3. Replays ops → reconstructs exact document state at V
+4. On confirm restore: write reconstructed state as new snapshot through normal save path
+
+## 5. Database Design
 
 ### Selection Reasoning
 
 | Store | Why |
 |---|---|
-| Cassandra (Ops DB) | Append-only op log, extremely high write throughput (3M+ ops/sec), time-series, partition by docId |
-| Cassandra (VersionDB) | Document metadata and version history, high availability, flexible schema |
-| Redis | Sub-ms canonical copy reads, TTL-based lifecycle, in-memory OT state |
-| S3 | Cheap durable snapshot storage, CDN-friendly |
-| Kafka | Decouples editor from persistence; durable event log for ops and metadata |
+| Cassandra (Ops DB) | Append-only op log, 3M+ ops/sec, time-series, partition by docId |
+| Cassandra (VersionDB) | Document metadata and version history, high availability |
+| Redis | Sub-ms canonical copy reads, TTL-based lifecycle, distributed lock |
+| S3 | Cheap durable snapshot storage |
+| Kafka | Decouples editor from persistence; durable event log |
 
 ### Cassandra — operations
 
@@ -107,7 +229,7 @@ Partition key: `doc_id`, Clustering: `timestamp ASC`
 | operation_id | UUID |
 | event | TEXT (JSON — type, position, content) |
 
-### Cassandra — version_db (document metadata)
+### Cassandra — version_db
 
 | Field | Type |
 |---|---|
@@ -125,107 +247,14 @@ Partition key: `doc_id`, Clustering: `timestamp ASC`
 
 | Key Pattern | Type | Value | TTL |
 |---|---|---|---|
-| `doc:canonical:{docId}` | String | full document content (blob) | TTL — evicted when doc goes inactive |
+| `doc:canonical:{docId}` | String | full document content | evicted when inactive |
 | `doc:sessions:{docId}` | Set | connected sessionIds | — |
 | `session:{sessionId}` | String | `{userId, docId}` | 86400s |
-
-## 5. Key Flows
-
-### 5.1 Auth — Registration & Login
-
-**Register:**
-1. Client → API Gateway → User Service
-2. Validate, hash password, write to DB
-3. Return JWT + refresh token
-
-**Login:**
-1. Validate credentials, generate JWT (1hr) + refresh token
-2. Store session in Redis
-3. Return tokens
-
-**Every request:** API Gateway validates JWT + session on both HTTP and WebSocket connections
-
-### 5.2 Document Create & Open
-
-**Create:**
-1. Client → API Gateway → Document Metadata Service
-2. Write initial metadata to VersionDB (Cassandra)
-3. Write empty initial snapshot to S3
-4. Return `docId` to client
-
-**Open:**
-1. Client → API Gateway → Document Metadata Service → fetch metadata + latest snapshot URL from VersionDB
-2. Client downloads initial document content from S3 (via CDN)
-3. Client establishes WebSocket connection to Document Editor Service (routed by `docId`)
-4. Document Editor Service loads canonical copy from Redis if present; otherwise loads from S3 snapshot + replays any ops since that snapshot from Cassandra
-5. Client begins sending/receiving ops
-
-### 5.3 Real-Time Collaborative Editing (OT Flow)
-
-The core problem: two users edit the same position simultaneously. OT resolves this by transforming concurrent ops so all clients converge to the same state.
-
-```
-Doc = "AC", both users at version 5
-
-User A: insert(1, "B")  → "ABC"
-User B: insert(1, "D")  → concurrent, same baseVersion
-
-Server applies A first → version 6: "ABC"
-Server transforms B against A → insert(2, "D") → version 7: "ABDC"
-
-Both clients converge to "ABDC"
-```
-
-**Flow:**
-1. User types → client generates op: `{docId, event: {type, position, content}, baseVersion}`
-2. Client sends op via WebSocket to Document Editor Service
-3. Document Editor Service acquires lock on `docId` (Redis SETNX, short TTL)
-4. Fetches current version from Redis canonical copy
-5. If `baseVersion < currentVersion`: transform op against all intermediate ops
-6. Apply transformed op to Redis canonical copy, increment version
-7. Release lock
-8. Publish op to Kafka (Operation Consumer persists to Cassandra async)
-9. Broadcast transformed op to all other sessions in `doc:sessions:{docId}`
-10. ACK sender with new version
-
-**Client-side:** maintains a pending ops queue; transforms pending ops against any incoming remote op before re-applying locally
-
-### 5.4 Snapshotting & Versioning
-
-Two triggers for creating a snapshot:
-- Manual save by user
-- Autosave every 10–20 seconds by the client
-
-**Flow:**
-1. Trigger fires → Document Editor Service reads current canonical copy from Redis
-2. Writes snapshot blob to S3: `snapshots/{docId}/{versionId}.json`
-3. Publishes metadata event to Kafka (metadata Kafka stream)
-4. Metadata Consumer consumes event → writes new version record to VersionDB (Cassandra) with S3 URL, timestamp, versionId
-
-### 5.5 Version Restore (Reconciliation Service)
-
-1. User requests a previous version → Document Metadata Service fetches version list from VersionDB
-2. User selects version V → Reconciliation Service loads snapshot from S3 for that version
-3. Fetches all ops after that snapshot's timestamp from Cassandra Operations DB
-4. Replays ops on top of snapshot → reconstructs exact document state at version V
-5. Returns reconstructed document to client (read-only preview)
-6. On confirm restore: reconstructed state written back as a new snapshot, flows through normal save path
-
-### 5.6 Document Load After Redis TTL Expiry
-
-When a document's canonical copy has been evicted from Redis (no active sessions):
-1. First user opens doc → Document Editor Service cache miss on Redis
-2. Fetches latest snapshot URL from VersionDB (Cassandra)
-3. Downloads snapshot from S3
-4. Fetches all ops after `last_snapshot_timestamp` from Cassandra Operations DB
-5. Replays ops → reconstructs current state
-6. Writes back to Redis canonical copy with TTL
-7. Subsequent users on same doc hit Redis directly
 
 ## 6. Key Interview Concepts
 
 ### Operational Transformation (OT)
-Every edit is an op: `insert(pos, text)` or `delete(pos, length)`. When two ops are concurrent (same `baseVersion`), the server transforms the second op's position to account for the first before applying. Requires a central server to serialize ops — this is why the Document Editor Service holds a per-doc lock.
+Every edit is an op: `insert(pos, text)` or `delete(pos, length)`. When two ops are concurrent (same `baseVersion`), the server transforms the second op's position to account for the first before applying. Requires a central server to serialize ops — this is why Document Editor Service holds a per-doc lock.
 
 Example: Doc = "AC"
 - User A inserts "B" at pos 1 → "ABC"
@@ -233,70 +262,44 @@ Example: Doc = "AC"
 - After transform: insert at pos 2 → "ABDC" ✓
 
 ### CRDT as an Alternative
-CRDTs assign a globally unique ID to every character; inserts/deletes are always commutative — no central coordinator needed. Used by Figma, Notion. Trade-off: more memory overhead, but better for P2P/offline-first. This design uses OT with a central server (simpler, Google Docs approach).
+CRDTs assign a globally unique ID to every character; inserts/deletes are always commutative — no central coordinator needed. Used by Figma, Notion. Trade-off: more memory overhead, but better for P2P/offline-first.
 
 ### Redis as Canonical Copy
-Redis holds the live working document state during active editing. It's the single source of truth for the Document Editor Service while a doc is hot. TTL ensures it's evicted when inactive. On eviction, the document is reconstructed from S3 + Cassandra on next open. Redis is a cache — Cassandra + S3 are the durable sources.
+Redis holds the live working document state during active editing. TTL ensures eviction when inactive. On eviction, document is reconstructed from S3 + Cassandra on next open. Redis is a cache — Cassandra + S3 are the durable sources.
 
 ### Kafka Decoupling
-Document Editor Service doesn't write to Cassandra directly — it publishes to Kafka and returns immediately. This keeps the critical path (OT + Redis update + broadcast) fast. Cassandra writes happen async via consumers. Risk: if Kafka consumer lags, ops aren't persisted yet. Mitigation: monitor consumer lag; Kafka retains messages so nothing is lost.
+Document Editor Service publishes to Kafka and returns immediately. Cassandra writes happen async via consumers. Keeps the critical path (OT + Redis update + broadcast) fast.
 
 ### Op Log as Event Source
-Cassandra Operations DB is an append-only log of every op ever applied. Snapshots are performance shortcuts — the full document can always be reconstructed by replaying all ops from the beginning. This is the event sourcing pattern: state = initial snapshot + all ops since.
-
-### Snapshot + Op Replay
-Replaying all ops from version 0 is too slow for large docs. Solution: periodic snapshots to S3. On open: load latest snapshot + replay only ops since that snapshot. Bounds load time regardless of document age or edit history length.
+Cassandra Operations DB is an append-only log of every op. Snapshots are performance shortcuts — the full document can always be reconstructed by replaying all ops. This is the event sourcing pattern.
 
 ### Consistent Hashing for Document Editor Service
-Document Editor Service is stateful (WebSocket connections + in-memory OT state). WebSocket Gateway uses consistent hashing on `docId` so all connections for the same document route to the same instance. Benefits: no cross-instance coordination for most ops, warm in-memory state. On scale-out, only docs in the moved hash range need to migrate.
+WebSocket Gateway uses consistent hashing on `docId` so all connections for the same document route to the same instance. Benefits: no cross-instance coordination, warm in-memory state.
 
 ### Distributed Lock per Document
-OT requires serialized op application per document. Redis `SETNX` with short TTL acts as a distributed lock on `docId`. Consistent hashing means the same instance usually handles a doc, so lock contention is rare — it's a safety net for edge cases (instance restart, rebalancing).
-
-### CAP Trade-off
-Op processing is CP — consistency required, all collaborators must converge. If lock unavailable, writes fail rather than diverge. Presence/cursor data is AP — slight staleness is fine.
-
-### Idempotency
-Each op carries a `client_id` + `baseVersion`. On retry, Document Editor Service checks if the op already exists in the Cassandra log before applying. Prevents duplicate ops from appearing in the document.
+OT requires serialized op application per document. Redis `SETNX` with short TTL acts as a distributed lock on `docId`. Consistent hashing means the same instance usually handles a doc — lock is a safety net.
 
 ## 7. Failure Scenarios
 
-### Document Editor Service Instance Crash
-- Detection: WebSocket connections drop, health check fails
-- Recovery: clients reconnect with exponential backoff; consistent hashing routes to a new instance; new instance loads canonical copy from Redis (still warm) or reconstructs from S3 + Cassandra; clients resend pending ops from their local queue
+### Document Editor Service Crash
+- Recovery: clients reconnect; new instance loads canonical copy from Redis (still warm) or reconstructs from S3 + Cassandra; clients resend pending ops
 - Prevention: Redis holds canonical copy independently of any instance
 
 ### Redis Failure (Canonical Copy Lost)
-- Impact: all active editing sessions lose in-memory state; effectively a forced reconnect for all users
-- Recovery: Redis Sentinel failover (<30s); on reconnect, Document Editor Service reconstructs doc from latest S3 snapshot + Cassandra ops since that snapshot; no data loss since Kafka/Cassandra are durable
-- Prevention: Redis Cluster + AOF persistence; autosave every 10–20s limits how much needs to be replayed
+- Impact: all active editing sessions lose in-memory state; forced reconnect
+- Recovery: Redis Sentinel failover (<30s); reconstruct from S3 + Cassandra ops; no data loss
+- Prevention: Redis Cluster + AOF; autosave every 10–20s limits replay needed
 
-### Kafka Consumer Lag (Operation Consumer)
-- Impact: ops not yet persisted to Cassandra; if Redis also fails before consumer catches up, recent ops could be lost
-- Recovery: Kafka retains messages (configurable retention); consumer catches up on recovery
-- Prevention: monitor consumer lag; alert if lag exceeds 10s; Kafka retention set to at least 24hr
+### Kafka Consumer Lag
+- Impact: ops not yet persisted to Cassandra; if Redis also fails, recent ops could be lost
+- Recovery: Kafka retains messages; consumer catches up on recovery
+- Prevention: monitor consumer lag; Kafka retention ≥ 24hr
 
-### Cassandra Write Failure
-- Impact: ops lost if Kafka also fails (double failure)
-- Recovery: Cassandra RF=3, QUORUM writes; failed writes retried by consumer with idempotency key
-- Prevention: multi-datacenter replication; dead letter queue for failed writes
-
-### Distributed Lock Expiry During Op Processing
-- Scenario: Redis lock TTL expires mid-transform → two instances both acquire lock, apply same op twice
-- Recovery: idempotency key on op deduplicates; version mismatch causes one instance to reject and retry
-- Prevention: lock TTL > max op processing time; monitor lock acquisition latency
-
-### Reconciliation Service Failure
-- Impact: version restore unavailable; non-critical path, real-time editing unaffected
-- Recovery: stateless service, restarts and retries; S3 and Cassandra data intact
-- Prevention: health checks, auto-restart
+### Distributed Lock Expiry Mid-Op
+- Scenario: lock TTL expires mid-transform → two instances both acquire lock
+- Recovery: idempotency key deduplicates; version mismatch causes one to reject and retry
+- Prevention: lock TTL > max op processing time
 
 ### Long Reconnect After Disconnect
-- Scenario: user disconnects for minutes, reconnects with stale `baseVersion`
-- Recovery: Document Editor Service fetches all ops since client's `baseVersion` from Cassandra, transforms client's pending ops against them, returns updated state
-- If gap is too large: return full current snapshot from Redis/S3, client reloads
-
-### DDoS / Op Flooding
-- Rate limit ops per user per document at WebSocket Gateway
-- API Gateway rate limits per IP + per JWT
-- Document Editor Service rejects ops exceeding per-doc rate threshold
+- Scenario: user disconnects for minutes, reconnects with stale baseVersion
+- Recovery: fetch all ops since client's baseVersion from Cassandra, transform pending ops, return updated state; if gap too large, return full current snapshot

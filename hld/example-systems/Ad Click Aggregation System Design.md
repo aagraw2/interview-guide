@@ -3,9 +3,6 @@
 ## System Overview
 A real-time ad click aggregation system that ingests billions of click events, aggregates them by ad/campaign/time window, detects click fraud, and serves aggregated metrics to advertisers — similar to Google Ads or Facebook Ads analytics backend.
 
-## Architecture Diagram
-#### (To be inserted)
-
 ## 1. Requirements
 
 ### Functional Requirements
@@ -48,35 +45,161 @@ Aggregated data     = 10M ads × 1440 min/day × 50B = 720GB/day
   → retain 2 years = ~525TB
 ```
 
-## 3. Core Components
+## 3. Architecture Diagram
 
-**API Gateway** — Auth, rate limiting, routing for click ingestion and query APIs
+### Components
 
-**Click Ingestion Service** — Receives click events; validates basic format; deduplicates; publishes to Kafka; returns 200 immediately (async)
+| Component | Role |
+|---|---|
+| API Gateway | Auth, rate limiting, routing |
+| Click Ingestion Svc | Validate, dedup, publish to Kafka, return 200 async |
+| Fraud Detection Svc | Score clicks by IP, velocity, ML; route to valid/fraud topics |
+| Stream Aggregation Svc | Rolling windows per minute/hour; flush to Aggregation DB |
+| Batch Aggregation Svc | Daily reprocess from S3 for billing accuracy |
+| Query Svc | Serve aggregated metrics from Aggregation DB + Redis cache |
+| Billing Svc | Generate invoices from daily valid click counts |
+| Kafka | Durable stream; topics: `raw-clicks`, `valid-clicks`, `fraud-clicks`; partitioned by adId |
+| Cassandra (Raw Events) | Append-only raw click store; partition by adId + date |
+| Aggregation DB (InfluxDB / Cassandra) | Pre-aggregated counts by adId + time window |
+| Redis | Dedup cache, real-time counters, query result cache |
+| S3 | Cold storage for raw events (30d retention); batch source |
 
-**Kafka** — Durable click event stream; partitioned by `adId` for ordered processing per ad; high-throughput backbone
+### Overview
 
-**Fraud Detection Service** — Kafka consumer; real-time fraud scoring per click (IP reputation, click velocity, user agent); filters fraudulent clicks; publishes valid clicks to separate Kafka topic
+```mermaid
+flowchart LR
+    clients["Clients<br/>browsers / apps"]
+    lb["LB & API Gateway"]
 
-**Stream Aggregation Service** — Kafka consumer on valid clicks topic; maintains in-memory rolling windows (per minute, per hour); flushes aggregated counts to Aggregation DB
+    ingestion["Click Ingestion Svc"]
+    fraud["Fraud Detection Svc"]
+    stream["Stream Aggregation Svc"]
+    query["Read / Query Svc"]
+    batch["Batch Aggregation Svc"]
+    billing["Billing Svc"]
+    advertisers["Advertisers"]
 
-**Batch Aggregation Service** — Daily batch job; reprocesses raw events from cold storage for accurate billing reconciliation; handles late-arriving events
+    kafka[("Kafka<br/>raw · valid · fraud clicks")]
+    redis[("Redis")]
+    cassandra[("Cassandra<br/>Raw Events")]
+    s3[("S3<br/>Cold Storage")]
+    aggdb[("Aggregation DB<br/>InfluxDB / Cassandra")]
 
-**Query Service** — Serves aggregated metrics to advertisers; reads from Aggregation DB and Redis cache
+    clients -->|"POST /click"| lb
+    clients -->|"GET /stats"| lb
+    lb --> ingestion
+    lb --> query
 
-**Billing Service** — Reads daily aggregated valid click counts; generates invoices; integrates with payment system
+    ingestion --> redis
+    ingestion --> cassandra
+    ingestion -->|"raw-clicks"| kafka
 
-**Click Event Store (Cassandra)** — Raw click events; append-only; partition by adId + date
+    kafka -->|"raw-clicks"| fraud
+    fraud --> redis
+    fraud -->|"valid-clicks<br/>fraud-clicks"| kafka
 
-**Aggregation DB (InfluxDB / Cassandra)** — Pre-aggregated click counts by adId + time window
+    kafka -->|"valid-clicks"| stream
+    stream --> redis
+    stream --> aggdb
 
-**Redis** — Real-time aggregation buffer, deduplication cache, query result cache
+    query --> redis
+    query --> aggdb
+    query --> advertisers
 
-**S3** — Cold storage for raw events (30-day retention); batch processing source
+    cassandra -.-> s3
+    s3 --> batch
+    batch --> aggdb
+    batch --> billing
+```
 
-**Kafka** — Two topics: `raw-clicks` and `valid-clicks`
+## 4. Key Flows
 
-## 4. Database Design
+### 4.1 Click Ingestion
+
+```mermaid
+flowchart LR
+    clients["Clients<br/>browsers / apps"] -->|"POST /click"| lb["Load Balancer<br/>& API Gateway"]
+    lb --> ingestion["Click Ingestion Svc<br/>validate · dedup<br/>return 200 immediately"]
+    ingestion -->|"SET NX EX 3600<br/>dedup check"| redis[("Redis")]
+    ingestion -->|"store raw event"| cassandra[("Cassandra<br/>Raw Events<br/>ad_id+date · timestamp DESC")]
+    ingestion -->|"publish raw-clicks<br/>partitioned by adId"| kafka[("Kafka<br/>raw-clicks")]
+```
+
+1. Browser/app sends `POST /click` with `{clickId, adId, userId, ip, userAgent, timestamp}`
+2. Click Ingestion Service validates format
+3. Deduplication: `SET dedup:{clickId} 1 NX EX 3600` — if key exists, duplicate → discard
+4. Publish to Kafka `raw-clicks` topic, partition key = `adId`
+5. Return 200 immediately (async processing)
+
+**Why partition by adId:** all clicks for the same ad go to the same Kafka partition → ordered processing → accurate per-ad aggregation without cross-partition coordination.
+
+### 4.2 Fraud Detection
+
+```mermaid
+flowchart LR
+    kafka[("Kafka<br/>raw-clicks")] -->|"consume"| fraud["Fraud Detection Svc<br/>IP · velocity · ML scoring"]
+    fraud -->|"IP velocity check"| redis[("Redis")]
+    fraud -->|"publish"| kafka_valid[("Kafka<br/>valid-clicks")]
+    fraud -->|"publish"| kafka_fraud[("Kafka<br/>fraud-clicks")]
+```
+
+**Fraud signals:**
+- IP velocity: `INCR fraud:ip:{ip}` in Redis; if > 100 clicks/hr → fraud
+- User velocity: > 50 clicks/hr from same user → fraud
+- Bot detection: known bot user agents → fraud
+- Time pattern: clicks < 1s apart → fraud
+
+Valid click → publish to `valid-clicks`. Fraud click → publish to `fraud-clicks` + update Cassandra `is_fraud=true`.
+
+### 4.3 Stream Aggregation
+
+```mermaid
+flowchart LR
+    kafka[("Kafka<br/>valid-clicks")] -->|"consume"| stream["Stream Aggregation Svc<br/>rolling windows<br/>flush every minute"]
+    stream -->|"update real-time counters"| redis[("Redis")]
+    stream -->|"flush windows"| aggdb[("Aggregation DB<br/>InfluxDB / Cassandra")]
+```
+
+1. Service maintains in-memory hash maps per time window: `window[adId]++`
+2. Every minute: flush window to Aggregation DB
+3. Hourly and daily aggregations computed from minute-level data
+4. Late-arriving events (up to 5 min): still counted in the correct window
+
+### 4.4 Advertiser Query
+
+```mermaid
+flowchart LR
+    advertisers["Advertisers<br/>dashboard"] -->|"GET /stats"| lb["Load Balancer<br/>& API Gateway"]
+    lb --> query["Read / Query Svc<br/>get stats · clicks · spend"]
+    query -->|"cache hit/miss"| redis[("Redis<br/>query cache · TTL 60s")]
+    query -->|"query aggregations"| aggdb[("Aggregation DB<br/>InfluxDB / Cassandra")]
+    query -->|"metrics response"| advertisers
+```
+
+1. Advertiser queries "clicks for campaign X in last 24hr"
+2. Query Service checks Redis cache (TTL 60s)
+3. Cache miss: query Aggregation DB for hourly buckets in range
+4. Sum up buckets, cache result, return to advertiser
+
+### 4.5 Batch Reconciliation & Billing
+
+```mermaid
+flowchart LR
+    cassandra[("Cassandra<br/>Raw Events")] -.->|"daily archive"| s3[("S3<br/>cold storage · 30d")]
+    s3 -->|"read raw events"| batch["Batch Aggregation Svc<br/>re-process S3<br/>resolve conflicts"]
+    batch -->|"reconcile & update"| aggdb[("Aggregation DB<br/>InfluxDB / Cassandra")]
+    batch -->|"daily valid counts"| billing["Billing Svc<br/>valid_click_count<br/>spend_amount · invoice"]
+```
+
+Daily batch job for billing accuracy:
+1. Read all raw click events from S3 (previous day)
+2. Re-apply fraud detection with updated models (more accurate than real-time)
+3. Recompute daily aggregations and compare with stream results
+4. Use batch results for billing — stream results are for display only
+
+This two-layer approach is the **Lambda Architecture** pattern.
+
+## 5. Database Design
 
 ### Cassandra — click_events (raw)
 
@@ -117,117 +240,29 @@ Partition key: `ad_id + date`, Clustering: `timestamp DESC`
 | `fraud:ip:{ip}` | Counter | clicks from IP in 1hr | 3600s |
 | `query:cache:{queryHash}` | String | aggregation result JSON | 60s |
 
-## 5. Key Flows
-
-### 5.1 Click Ingestion
-
-```
-Ad click → Click Ingestion Service
-                  ↓
-    Validate: required fields present
-    Dedup: check Redis dedup:{clickId}
-                  ↓
-    Publish to Kafka: raw-clicks topic (partitioned by adId)
-                  ↓
-    Return 200 OK immediately
-```
-
-1. User clicks ad → browser/app sends `POST /click` with `{clickId, adId, userId, ip, userAgent, timestamp}`
-2. Click Ingestion Service validates format
-3. Deduplication: `SET dedup:{clickId} 1 NX EX 3600` — if key exists, duplicate → discard
-4. Publish to Kafka `raw-clicks` topic, partition key = `adId`
-5. Return 200 immediately (async processing)
-
-**Why partition by adId:** all clicks for the same ad go to the same Kafka partition → ordered processing → accurate per-ad aggregation without cross-partition coordination.
-
-### 5.2 Fraud Detection
-
-```
-Kafka (raw-clicks) → Fraud Detection Service
-                              ↓
-    Score each click:
-      - IP velocity: >100 clicks/hr from same IP → fraud
-      - User velocity: >50 clicks/hr from same user → fraud
-      - Bot detection: known bot user agents → fraud
-      - Click pattern: clicks too fast (< 1s between clicks) → fraud
-              ↓
-    Valid click → publish to Kafka (valid-clicks)
-    Fraud click → publish to Kafka (fraud-clicks) + update Cassandra is_fraud=true
-```
-
-**Fraud signals:**
-- IP reputation: check against known bot IP lists
-- Click velocity: `INCR fraud:ip:{ip}` in Redis; if > threshold → fraud
-- User agent: known bot patterns (Googlebot, scrapers)
-- Geographic anomaly: clicks from unexpected regions for targeted ad
-- Time pattern: clicks at inhuman speed
-
-### 5.3 Stream Aggregation
-
-```
-Kafka (valid-clicks) → Stream Aggregation Service
-                                  ↓
-    Maintain in-memory windows:
-      per-minute: {adId → count} for current minute
-      per-hour:   {adId → count} for current hour
-                                  ↓
-    On window close (every minute):
-      Flush to Aggregation DB: {adId, window_start, valid_clicks}
-      Update Redis real-time counter
-```
-
-1. Stream Aggregation Service maintains in-memory hash maps per time window
-2. On each valid click: `window[adId]++`
-3. Every minute: flush window to Aggregation DB (InfluxDB or Cassandra)
-4. Hourly and daily aggregations computed from minute-level data
-5. Late-arriving events (network delay): handled by allowing 5-min late window; events within 5 min of window close still counted
-
-### 5.4 Batch Reconciliation
-
-Daily batch job for billing accuracy:
-1. Read all raw click events from S3 (previous day)
-2. Re-apply fraud detection with updated models (more accurate than real-time)
-3. Recompute daily aggregations
-4. Compare with stream aggregations — flag discrepancies
-5. Use batch results for billing (more accurate than stream)
-
-This two-layer approach (stream for real-time display, batch for billing) is the Lambda Architecture pattern.
-
-### 5.5 Advertiser Query
-
-1. Advertiser queries "clicks for campaign X in last 24hr"
-2. Query Service checks Redis cache (TTL 60s)
-3. Cache miss: query Aggregation DB for hourly buckets in range
-4. Sum up buckets, return result
-5. Cache result in Redis
-
 ## 6. Key Interview Concepts
 
 ### Lambda Architecture
-Two processing paths for different needs:
-- **Speed layer (stream):** Kafka → Stream Aggregation → real-time metrics (approximate, low latency)
-- **Batch layer:** S3 → Batch Aggregation → accurate billing metrics (exact, higher latency)
-- **Serving layer:** merges both for queries
-
-Stream gives fast approximate results; batch gives accurate final results. Billing uses batch; dashboards use stream.
+- Speed layer (stream): Kafka → Stream Aggregation → real-time metrics (approximate, low latency)
+- Batch layer: S3 → Batch Aggregation → accurate billing metrics (exact, higher latency)
+- Serving layer: merges both for queries
 
 ### Kafka Partitioning by adId
-All clicks for the same ad go to the same partition → same consumer instance processes them in order → accurate per-ad counting without distributed coordination. If partitioned randomly, clicks for the same ad could go to different consumers → need cross-consumer aggregation (complex).
+All clicks for the same ad go to the same partition → same consumer instance processes them in order → accurate per-ad counting without distributed coordination.
 
 ### Deduplication
-Same click event can arrive multiple times (network retry, browser retry). Solution: `clickId` (UUID generated client-side) + Redis `SET NX EX` with 1hr TTL. If `clickId` already seen → discard. TTL limits Redis memory usage.
+`clickId` (UUID generated client-side) + Redis `SET NX EX` with 1hr TTL. If `clickId` already seen → discard. TTL limits Redis memory usage.
 
 ### Late-Arriving Events
-Network delays mean a click at 12:59:55 might arrive at 13:00:05 (after the 1pm window closed). Solution: allow 5-min late window — events arriving within 5 min of window close are still counted in that window. Events arriving later are counted in current window (acceptable approximation).
+A click at 12:59:55 might arrive at 13:00:05. Solution: allow 5-min late window — events arriving within 5 min of window close still counted in that window.
 
 ### Fraud Detection at Scale
-1M clicks/sec through fraud detection. Must be fast (<1ms per click). Solution:
 - Simple rules in-memory (IP velocity, user agent) — O(1) Redis lookups
 - Complex ML models run async on sampled traffic
 - Known fraud IPs/users cached in Redis for fast lookup
 
 ### Billing Accuracy
-Advertisers pay per valid click. Over-counting = advertiser overpays (legal risk). Under-counting = revenue loss. Solution: batch reconciliation with more accurate fraud models; billing uses batch results; stream results are for display only.
+Over-counting = advertiser overpays (legal risk). Under-counting = revenue loss. Batch reconciliation with more accurate fraud models; billing always uses batch results.
 
 ## 7. Failure Scenarios
 
@@ -243,15 +278,15 @@ Advertisers pay per valid click. Over-counting = advertiser overpays (legal risk
 
 ### Fraud Detection Service Failure
 - Impact: all clicks treated as valid (fail open) or all blocked (fail closed)
-- Recovery: fail open with enhanced logging; alert ops; Fraud Service is stateless, restarts quickly
+- Recovery: fail open with enhanced logging; Fraud Service is stateless, restarts quickly
 - Prevention: multiple Fraud Detection instances; circuit breaker
 
 ### Duplicate Click Storm (DDoS)
 - Scenario: attacker sends millions of clicks with same clickId
-- Recovery: Redis `SET NX` deduplicates all duplicates; only first click processed
+- Recovery: Redis `SET NX` deduplicates all; only first click processed
 - Prevention: rate limiting at API Gateway per IP; CAPTCHA for suspicious traffic
 
 ### Late Batch Reconciliation Discrepancy
 - Scenario: stream count = 1M, batch count = 950K (50K fraud detected in batch)
 - Recovery: billing uses batch count; stream count updated retroactively in dashboard
-- Prevention: this is expected behavior — stream is approximate, batch is authoritative
+- Prevention: expected behavior — stream is approximate, batch is authoritative

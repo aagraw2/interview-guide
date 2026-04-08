@@ -1,10 +1,7 @@
 # Payout System Design
 
 ## System Overview
-A payout system that disburses money from a platform to multiple recipients (sellers, drivers, freelancers, affiliates) — handling bulk payouts, bank transfers, UPI/wallet credits, scheduling, failure retries, and reconciliation. Used by platforms like Amazon Seller Payouts, Uber Driver Earnings, or Upwork Freelancer Payments.
-
-## Architecture Diagram
-#### (To be inserted)
+A payout system that disburses money from a platform to multiple recipients (sellers, drivers, freelancers, affiliates) — handling bulk payouts, bank transfers, UPI/wallet credits, scheduling, failure retries, and reconciliation.
 
 ## 1. Requirements
 
@@ -18,7 +15,7 @@ A payout system that disburses money from a platform to multiple recipients (sel
 - Reconciliation with bank/payment gateway
 
 ### Non-Functional Requirements
-- Availability: 99.99% — payout processing must not stop
+- Availability: 99.99%
 - Consistency: Strong — no double payout, no missed payout
 - Durability: Every payout instruction must be persisted before processing
 - Idempotency: Retried payouts must not result in double disbursement
@@ -27,9 +24,7 @@ A payout system that disburses money from a platform to multiple recipients (sel
 ## 2. Back-of-the-Envelope Estimation
 
 ### Assumptions
-- 1M recipients on platform
-- 5M payouts/day (daily/weekly settlement cycles)
-- Average payout: $50
+- 1M recipients, 5M payouts/day
 - Peak: end of week/month settlement — 10× normal
 - Payout methods: 60% bank transfer, 30% UPI, 10% wallet
 
@@ -37,7 +32,6 @@ A payout system that disburses money from a platform to multiple recipients (sel
 ```
 Payouts/sec (avg)   = 5M / 86400 ≈ 58/sec
 Payouts/sec (peak)  = 580/sec (settlement day)
-
 Bank API calls/sec  = 58 × 0.6 = 35/sec (rate-limited by bank)
 ```
 
@@ -45,46 +39,139 @@ Bank API calls/sec  = 58 × 0.6 = 35/sec (rate-limited by bank)
 ```
 Payout records/day  = 5M × 1KB = 5GB/day → ~1.8TB/year
 Ledger entries      = 5M × 2 entries × 300B = 3GB/day
-Audit log           = 5M × 500B = 2.5GB/day
 ```
 
-## 3. Core Components
+## 3. Architecture Diagram
 
-**API Gateway** — Auth, rate limiting, routing
+### Components
 
-**Payout Service** — Core orchestrator; creates payout instructions; manages payout lifecycle; idempotency enforcement
+| Component | Role |
+|---|---|
+| API Gateway | Auth, rate limiting, routing |
+| Payout Service | Core orchestrator; creates payout instructions; idempotency enforcement |
+| Payout Scheduler | Triggers scheduled payout batches; publishes to Kafka |
+| Payout Processor | Kafka consumer; routes to payment rail; updates status |
+| Bank Transfer Service | Integrates with NEFT/RTGS/IMPS/ACH APIs |
+| UPI Service | Integrates with UPI payment rails; VPA validation |
+| Wallet Credit Service | Credits internal wallet balance; direct DB update |
+| Retry Service | Monitors failed payouts; exponential backoff retry |
+| Hold Service | Manages payout holds (fraud, compliance) |
+| Ledger Service | Double-entry bookkeeping; immutable |
+| Reconciliation Service | Matches payout records with bank/gateway confirmations |
+| Notification Service | Kafka consumer; notifies recipients of payout status |
+| Payout DB (PostgreSQL) | Payout instructions, status, recipient details |
+| Ledger DB (PostgreSQL) | Double-entry ledger, immutable |
+| Audit Log (Cassandra) | Immutable audit trail |
+| Redis | Idempotency keys, payout state cache, bank API rate limiting |
+| Kafka | Payout job queue, retry queue, dead letter queue |
 
-**Payout Scheduler** — Triggers scheduled payout batches (daily/weekly); reads eligible recipients from Payout DB; publishes to Kafka
+### Overview
 
-**Payout Processor** — Kafka consumer; processes individual payout instructions; calls appropriate payment rail (bank/UPI/wallet); updates status
+```mermaid
+flowchart LR
+    platform["Platform<br/>Amazon · Uber · Upwork"]
+    apigw["API Gateway"]
 
-**Bank Transfer Service** — Integrates with NEFT/RTGS/IMPS/ACH APIs; handles bank-specific formats and rate limits
+    payoutSvc["Payout Service<br/>idempotency · validation"]
+    scheduler["Payout Scheduler<br/>daily / weekly batches"]
+    processor["Payout Processor<br/>route to payment rail"]
+    bankSvc["Bank Transfer Service<br/>NEFT / IMPS / ACH"]
+    upiSvc["UPI Service"]
+    walletSvc["Wallet Credit Service"]
+    retrySvc["Retry Service<br/>exponential backoff"]
+    holdSvc["Hold Service"]
+    ledger["Ledger Service"]
+    notifSvc["Notification Service"]
 
-**UPI Service** — Integrates with UPI payment rails; handles VPA (Virtual Payment Address) validation and transfer
+    payoutDB[("Payout DB<br/>PostgreSQL")]
+    ledgerDB[("Ledger DB<br/>PostgreSQL")]
+    auditLog[("Audit Log<br/>Cassandra")]
+    redis[("Redis<br/>idempotency · rate limit")]
+    kafka[("Kafka<br/>payouts · retry · dlq")]
 
-**Wallet Credit Service** — Credits internal wallet balance; direct DB update (no external API)
+    platform --> apigw
+    apigw --> payoutSvc
+    payoutSvc --> payoutDB
+    payoutSvc --> ledger
+    payoutSvc -->|"publish"| kafka
+    payoutSvc --> holdSvc
+    payoutSvc --> redis
 
-**Retry Service** — Monitors failed payouts; applies retry logic with backoff; re-publishes to Kafka
+    holdSvc --> payoutDB
 
-**Hold Service** — Manages payout holds (fraud, compliance, dispute); blocks payout until released
+    scheduler --> payoutDB
+    scheduler -->|"bulk publish"| kafka
 
-**Ledger Service** — Double-entry bookkeeping for all payout movements; immutable
+    kafka --> processor
+    processor --> bankSvc
+    processor --> upiSvc
+    processor --> walletSvc
+    processor -->|"failed"| kafka
+    kafka --> retrySvc
+    retrySvc -->|"backoff retry"| kafka
 
-**Reconciliation Service** — Matches payout records with bank/gateway confirmations
+    ledger --> ledgerDB
+    ledger --> auditLog
+    kafka --> notifSvc
+```
 
-**Notification Service** — Kafka consumer; notifies recipients of payout status
+## 4. Key Flows
 
-**Payout DB (PostgreSQL)** — Payout instructions, status, recipient details
+### 4.1 Single Payout Initiation
 
-**Ledger DB (PostgreSQL)** — Double-entry ledger, immutable
+```mermaid
+flowchart LR
+    platform["Platform"] -->|"POST /payouts<br/>idempotency_key"| payoutSvc["Payout Service"]
+    payoutSvc -->|"check idempotency"| redis[("Redis")]
+    payoutSvc -->|"validate KYC + no hold"| payoutDB[("Payout DB")]
+    payoutSvc -->|"status=pending<br/>DEBIT platform ledger"| payoutDB
+    payoutSvc -->|"publish"| kafka[("Kafka<br/>payouts")]
+    payoutSvc -->|"202 + payoutId"| platform
+```
 
-**Audit Log (Cassandra)** — Immutable audit trail of every action
+1. Platform sends `idempotency_key = hash(recipientId + amount + date)`
+2. Check Redis — if key exists, return existing `payoutId` (no duplicate)
+3. Validate: recipient KYC verified, no hold, sufficient platform balance
+4. Write payout record (`status = pending`) + ledger debit entry
+5. Publish to Kafka → return `payoutId` immediately
 
-**Redis** — Idempotency keys, payout state cache, rate limiting per bank API
+### 4.2 Payout Processing
 
-**Kafka** — Payout job queue, retry queue, dead letter queue, notification events
+```mermaid
+flowchart LR
+    kafka[("Kafka<br/>payouts")] --> processor["Payout Processor<br/>status=processing"]
+    processor -->|"bank"| bankSvc["Bank Transfer Service<br/>NEFT / IMPS API"]
+    processor -->|"upi"| upiSvc["UPI Service"]
+    processor -->|"wallet"| walletSvc["Wallet Credit Service"]
+    bankSvc -->|"success: bank_reference"| processor
+    processor -->|"status=success<br/>CREDIT recipient ledger"| payoutDB[("Payout DB")]
+    processor -->|"PAYOUT_SUCCESS"| kafka2[("Kafka")]
+    kafka2 --> notifSvc["Notification Service"]
+    bankSvc -->|"failure"| processor
+    processor -->|"retry_count < max: publish retry"| kafka3[("Kafka<br/>retry")]
+    processor -->|"exhausted: publish dlq"| kafka4[("Kafka<br/>dlq")]
+```
 
-## 4. Database Design
+### 4.3 Bulk Payout (Batch)
+
+```mermaid
+flowchart LR
+    scheduler["Payout Scheduler<br/>Friday 6pm trigger"] -->|"query eligible payouts"| payoutDB[("Payout DB")]
+    scheduler -->|"create batch record"| payoutDB
+    scheduler -->|"bulk publish"| kafka[("Kafka<br/>payouts")]
+    kafka --> processors["Payout Processors × N<br/>parallel processing"]
+    processors -->|"update batch progress"| payoutDB
+```
+
+### 4.4 Retry Flow
+
+Failed payout → `retry` topic → Retry Service applies backoff (5min, 30min, 2hr, 24hr) → after max retries → `dead_letter` topic → alert ops team
+
+### 4.5 Payout Hold
+
+Fraud/compliance flags recipient → Hold Service sets `payout_hold = true` → Payout Processor skips held payouts → on hold release, status reset to `pending`, re-published to Kafka
+
+## 5. Database Design
 
 ### PostgreSQL — payouts
 
@@ -104,18 +191,6 @@ Audit log           = 5M × 500B = 2.5GB/day
 | processed_at | TIMESTAMP, nullable |
 | failure_reason | TEXT, nullable |
 | batch_id | UUID, nullable |
-
-### PostgreSQL — payout_batches
-
-| Field | Type |
-|---|---|
-| batch_id | UUID (PK) |
-| total_count | INT |
-| total_amount | DECIMAL |
-| success_count | INT |
-| failed_count | INT |
-| status | ENUM (pending / processing / completed) |
-| created_at | TIMESTAMP |
 
 ### PostgreSQL — recipients
 
@@ -150,139 +225,44 @@ Audit log           = 5M × 500B = 2.5GB/day
 | `payout:status:{payoutId}` | String | status | 300s |
 | `bank:rate:{bankCode}` | Counter | API calls in window | 60s |
 
-## 5. Key Flows
-
-### 5.1 Single Payout Initiation
-
-```
-Client → Payout Service
-              ↓
-    Check idempotency key (Redis)
-              ↓
-    Validate recipient (KYC verified, no hold)
-              ↓
-    Write payout record (status=pending) to PostgreSQL
-    Write ledger debit entry
-              ↓
-    Publish to Kafka payout queue
-              ↓
-    Return payoutId (202 Accepted)
-```
-
-1. Platform initiates payout with `idempotency_key = hash(recipientId + amount + date)`
-2. Payout Service checks Redis — if key exists, return existing `payoutId` (no duplicate)
-3. Validate: recipient KYC verified, no hold, sufficient platform balance
-4. Write payout record to PostgreSQL (`status = pending`)
-5. Write ledger debit entry (platform account debited)
-6. Publish to Kafka `payouts` topic
-7. Return `payoutId` immediately
-
-### 5.2 Payout Processing
-
-```
-Kafka → Payout Processor
-              ↓
-    Update status = processing
-              ↓
-    Route to payment rail:
-      Bank → Bank Transfer Service → NEFT/IMPS API
-      UPI  → UPI Service → UPI rail
-      Wallet → Wallet Credit Service → DB update
-              ↓
-    On success:
-      Update status = success
-      Write ledger credit entry (recipient credited)
-      Publish SUCCESS event → Notification Service
-    On failure:
-      Update status = failed, store failure_reason
-      Publish to retry queue if retry_count < max_retries
-      Else publish to dead letter queue
-```
-
-1. Payout Processor consumes from Kafka
-2. Updates `status = processing` in DB
-3. Routes to appropriate payment rail based on `method`
-4. Bank Transfer: calls NEFT/IMPS API with account + IFSC + amount
-5. On bank API success: update `status = success`, `bank_reference = {bank_txn_id}`
-6. Write ledger credit entry (recipient account credited)
-7. Publish `PAYOUT_SUCCESS` to Kafka → Notification Service
-
-### 5.3 Bulk Payout (Batch)
-
-1. Payout Scheduler triggers at scheduled time (e.g., every Friday 6pm)
-2. Queries eligible recipients: `SELECT * FROM payouts WHERE status=pending AND scheduled_at <= now`
-3. Creates `payout_batch` record
-4. Publishes all payout jobs to Kafka in bulk
-5. Payout Processors consume in parallel (N processors × M payouts/sec)
-6. Batch status updated as payouts complete
-
-### 5.4 Retry Flow
-
-1. Failed payout published to Kafka `retry` topic
-2. Retry Service applies exponential backoff: 5min, 30min, 2hr, 24hr
-3. After max retries (e.g., 3): publish to `dead_letter` topic
-4. Dead letter payouts: alert ops team; manual investigation required
-5. Ops can manually re-trigger or cancel
-
-### 5.5 Payout Hold
-
-1. Fraud/compliance system flags recipient → Hold Service
-2. `UPDATE payouts SET status=held WHERE recipient_id=?`
-3. Payout Processor skips held payouts
-4. On hold release: status reset to `pending`, re-published to Kafka
-
 ## 6. Key Interview Concepts
 
 ### Idempotency is Critical
-Bank APIs can time out. Retrying without idempotency = double payout. Solution:
-- Platform generates `idempotency_key` before first attempt
-- Payout Service stores key in Redis (24hr TTL) and DB (unique constraint)
-- Bank APIs also support idempotency keys — pass through to prevent double transfer
-- On retry: same key → same result, no new transfer
+Bank APIs can time out. Retrying without idempotency = double payout. Platform generates `idempotency_key` before first attempt. Bank APIs also support idempotency keys — pass through to prevent double transfer.
 
 ### Double-Entry Ledger
-Every payout creates two ledger entries:
 ```
 Payout $100 to seller:
-  DEBIT  platform_account  $100  (platform balance decreases)
-  CREDIT seller_account    $100  (seller balance increases)
+  DEBIT  platform_account  $100
+  CREDIT seller_account    $100
 ```
 Sum of all entries = 0. Enables reconciliation and audit.
 
 ### Bank API Rate Limits
-Banks rate-limit API calls (e.g., 100 NEFT requests/sec). Solution:
-- Redis counter per bank: `INCR bank:rate:{bankCode}` with 60s window
-- If rate exceeded: queue payout for next window
-- Multiple bank integrations: distribute payouts across banks to maximize throughput
+Banks rate-limit API calls (e.g., 100 NEFT requests/sec). Redis counter per bank: `INCR bank:rate:{bankCode}` with 60s window. If rate exceeded: queue payout for next window.
 
 ### Payout Timing Windows
-NEFT: batch processing, 30-min settlement windows (8am–7pm). IMPS: 24/7, instant. RTGS: large amounts, business hours. Payout Processor selects appropriate rail based on amount, urgency, and time of day.
+NEFT: batch processing, 30-min settlement windows. IMPS: 24/7, instant. RTGS: large amounts, business hours. Payout Processor selects appropriate rail based on amount, urgency, and time of day.
 
 ### KYC Validation
-Payout to unverified recipient is a compliance risk. Always check `kyc_status = verified` before processing. KYC verification is async (document upload → manual/automated review → status update). Payouts to unverified recipients are held until KYC completes.
+Always check `kyc_status = verified` before processing. Payouts to unverified recipients are held until KYC completes.
 
 ## 7. Failure Scenarios
 
 ### Bank API Timeout
 - Recovery: retry with same idempotency key; bank returns same result if already processed
-- If bank processed but response lost: bank's idempotency key prevents double transfer; status updated on next retry
+- Prevention: idempotency key prevents double transfer
 
 ### Payout Processor Crash Mid-Processing
 - Detection: Kafka message not acknowledged
-- Recovery: Kafka redelivers; Payout Processor checks current status in DB — if already `success`, skip; if `processing`, re-attempt
+- Recovery: Kafka redelivers; Processor checks current status in DB — if already `success`, skip
 - Prevention: idempotency key prevents double processing
 
 ### PostgreSQL Failure
-- Impact: payout writes fail; Kafka messages not acknowledged; payouts not lost (Kafka retains)
-- Recovery: promote replica; Payout Processor retries after DB recovery
+- Recovery: promote replica; Payout Processor retries after DB recovery; Kafka retains messages
 - Prevention: synchronous replication; automated failover
 
 ### Insufficient Platform Balance
 - Detection: ledger balance check before payout initiation
-- Recovery: hold all pending payouts; alert finance team to top up platform account
+- Recovery: hold all pending payouts; alert finance team
 - Prevention: minimum balance alerts; auto top-up from reserve account
-
-### Dead Letter Queue Buildup
-- Scenario: bank API down for hours → many payouts fail all retries → dead letter queue grows
-- Recovery: ops team investigates; manually re-triggers payouts after bank recovery
-- Prevention: monitor dead letter queue depth; alert if > threshold

@@ -3,9 +3,6 @@
 ## System Overview
 A full-featured email client and server (think Gmail / Outlook) where users compose, send, and receive emails — with SMTP relay for outbound delivery, inbound SMTP for receiving, spam/malware filtering, attachment scanning, full-text search, and contact autocomplete.
 
-## Architecture Diagram
-#### (To be inserted)
-
 ## 1. Requirements
 
 ### Functional Requirements
@@ -45,76 +42,169 @@ Search queries/sec  = 500M × 5 / 86400 ≈ 29K/sec
 ### Storage
 ```
 Emails/day          = 5B × 75KB = 375TB/day
-Attachments         = stored in S3 separately
 User mailbox avg    = 15GB per user
 Total               = 1B × 15GB = 15EB
 ```
 
-## 3. Core Components
+## 3. Architecture Diagram
 
-**Load Balancer & API Gateway** — Auth, rate limiting, routing for web/mobile clients
+### Components
 
-**User Service** — Registration, login, JWT issuance; User DB (userId, email, password_hash, metadata); User Cache (Redis) for fast lookups; sharded by email using consistent hashing
+| Component | Role |
+|---|---|
+| LB & API Gateway | Auth, rate limiting, routing for web/mobile clients |
+| User Service | Registration, login, JWT; User Cache sharded by email (consistent hashing) |
+| Compose Service | Email composition; saves drafts to Draft DB |
+| Mail Send Service | Orchestrates outbound sending; publishes to Kafka |
+| Outbox Consumer Service | Kafka consumer; spam check, policy check, validation; routes to Orchestrator |
+| Outbox Delivery Orchestrator | Routes to Mailbox DB (internal) or SMTP Relay Workers (external) |
+| SMTP Relay Workers | Connect to external SMTP servers; SMTP handshake, TLS, retry |
+| Inbound SMTP Service | Receives from external servers; validates SPF/DKIM/DMARC; publishes to Kafka |
+| Spam/Malware Filtering | ML-based scoring + rule-based filters |
+| Attachment Scanner | Virus scan; file type validation; stores to S3 |
+| Search Service | Full-text search via Elasticsearch |
+| Aggregator Service | CDC from Mailbox DB to Elasticsearch |
+| Notification Service | Push/in-app notifications for new emails |
+| Mailbox DB (PostgreSQL) | Per-user email storage |
+| MX Cache (Redis) | Caches MX record lookups to avoid repeated DNS queries |
+| Kafka | `outbound_send_request` and `inbound_send_request` topics |
 
-**Compose Service** — Handles email composition; saves drafts to Draft DB; validates recipients
+### Overview
 
-**Mail Send Service** — Orchestrates outbound email sending; validates, routes to Outbox Consumer
+```mermaid
+flowchart LR
+    client["Client<br/>web / mobile"]
+    apigw["LB & API Gateway"]
 
-**Outbox Consumer Service** — Kafka consumer; processes outbound emails; calls Spam/Malware Filtering, Policy Check, Validation DB checks; routes to Outbox Delivery Orchestrator
+    userSvc["User Service<br/>consistent hash cache"]
+    composeSvc["Compose Service"]
+    sendSvc["Mail Send Service"]
+    outboxConsumer["Outbox Consumer<br/>spam · policy · validation"]
+    orchestrator["Outbox Delivery<br/>Orchestrator"]
+    smtpWorkers["SMTP Relay Workers"]
+    inboundSMTP["Inbound SMTP Service<br/>SPF/DKIM/DMARC"]
+    spamFilter["Spam/Malware Filter"]
+    attachScanner["Attachment Scanner"]
+    searchSvc["Search Service"]
+    notifSvc["Notification Service"]
 
-**Outbox Delivery Orchestrator** — Routes email to correct destination:
-- Internal recipient (same domain): deliver directly to recipient's Mailbox DB
-- External recipient: forward to SMTP Relay Workers
+    kafka[("Kafka<br/>outbound · inbound")]
+    mailboxDB[("Mailbox DB<br/>PostgreSQL")]
+    redis[("Redis<br/>user cache · MX cache")]
+    s3[("S3<br/>attachments")]
+    elastic[("Elasticsearch")]
 
-**SMTP Relay Workers** — Pool of workers that connect to external recipient SMTP servers; handle SMTP handshake, TLS, retry on failure; manage sending IP reputation
+    client --> apigw
+    apigw --> userSvc
+    apigw --> composeSvc
+    apigw --> sendSvc
+    apigw --> searchSvc
 
-**Inbound SMTP Service** — Receives emails from external SMTP servers (Outlook, Yahoo, etc.); validates sender (SPF/DKIM/DMARC); passes to Kafka for processing
+    sendSvc -->|"outbound_send_request"| kafka
+    kafka --> outboxConsumer
+    outboxConsumer --> spamFilter
+    outboxConsumer --> orchestrator
+    orchestrator -->|"internal"| mailboxDB
+    orchestrator -->|"external"| smtpWorkers
+    smtpWorkers -->|"MX lookup"| redis
+    smtpWorkers -->|"SMTP"| externalSMTP["External SMTP Server"]
 
-**Attachment Scanner** — Scans attachments for malware/viruses; validates file types; stores clean attachments to S3; returns signed URL
+    inboundSMTP -->|"inbound_send_request"| kafka
+    kafka --> spamFilter
+    kafka --> attachScanner
+    attachScanner --> s3
+    kafka --> mailboxDB
+    kafka --> notifSvc
 
-**Spam/Malware Filtering Service** — ML-based spam scoring + rule-based filters; checks sender reputation, content patterns, attachment hashes; marks as spam or blocks
+    mailboxDB -.->|"CDC"| elastic
+    searchSvc --> elastic
+    userSvc --> redis
+```
 
-**Policy Check** — Enforces organizational policies: attachment size limits, blocked domains, DLP (data loss prevention) rules
+## 4. Key Flows
 
-**Validation DB** — Stores validation rules: `sender_user_id, recipient_email, policy_user_id, route_type (INTERNAL/EXTERNAL), spam_check, attachment_check, status`
+### 4.1 Auth
 
-**Search Service** — Full-text email search via Elasticsearch; indexes subject, body, sender, recipients
+```mermaid
+flowchart LR
+    client["Client"] -->|"login"| apigw["API Gateway"]
+    apigw --> userSvc["User Service"]
+    userSvc -->|"consistent hash lookup"| redis[("Redis<br/>User Cache")]
+    redis -.->|"miss"| userDB[("User DB")]
+    userSvc -->|"JWT + session"| client
+```
 
-**Aggregator Service** — CDC pipeline from Mailbox DB to Elasticsearch for search indexing
+User Cache sharded by email using consistent hashing — same user always hits same cache node. 25/50 most recently emailed contacts cached per user for autocomplete.
 
-**Mailbox DB** — Per-user mailbox storage: `Outbox_Email` and `MailboxItem` tables
+### 4.2 Outbound Email Send
 
-**Mailbox Metadata DB** — Metadata about mailbox items (read status, labels, folder, thread_id)
+```mermaid
+flowchart LR
+    client["Client"] -->|"click Send"| sendSvc["Mail Send Service"]
+    sendSvc -->|"outbound_send_request"| kafka[("Kafka")]
+    kafka --> outboxConsumer["Outbox Consumer<br/>spam check · policy check"]
+    outboxConsumer --> orchestrator["Outbox Delivery Orchestrator"]
+    orchestrator -->|"internal recipient"| mailboxDB[("Mailbox DB")]
+    orchestrator -->|"external recipient"| smtpWorkers["SMTP Relay Workers"]
+    smtpWorkers -->|"MX lookup"| redis[("Redis MX Cache")]
+    smtpWorkers -->|"SMTP + TLS"| externalServer["External SMTP Server"]
+```
 
-**Draft DB** — Temporary storage for unsent drafts
+SMTP steps to external server:
+1. DNS MX record lookup (MX Cache → MX Resolver → DNS)
+2. TCP connection to MX server on port 25
+3. EHLO → STARTTLS → MAIL FROM → RCPT TO → DATA → 250 OK
 
-**MX Cache** — Caches MX record lookups (DNS → mail server for a domain); avoids repeated DNS queries
+### 4.3 Inbound Email Receive
 
-**MX Resolver** — Resolves MX records for external domains; used by SMTP Relay Workers to find recipient's mail server
+```mermaid
+flowchart LR
+    externalServer["External SMTP<br/>Outlook / Yahoo"] -->|"SMTP connection"| inboundSMTP["Inbound SMTP Service"]
+    inboundSMTP -->|"validate SPF/DKIM/DMARC"| inboundSMTP
+    inboundSMTP -->|"inbound_send_request"| kafka[("Kafka")]
+    kafka --> spamFilter["Spam/Malware Filter"]
+    kafka --> attachScanner["Attachment Scanner"]
+    attachScanner --> s3[("S3")]
+    kafka --> deliveryConsumer["Delivery Consumer"]
+    deliveryConsumer --> mailboxDB[("Mailbox DB")]
+    deliveryConsumer -->|"notify"| notifSvc["Notification Service"]
+```
 
-**Notification Service** — Kafka consumer; sends push/in-app notifications for new emails
+1. Validate SPF (sender IP authorized?), DKIM (signature valid?), DMARC (policy)
+2. Spam/Malware Filter scores email; Attachment Scanner scans + stores to S3
+3. Delivery Consumer writes to recipient's Mailbox DB → push notification
 
-**Kafka** — Two topics: `outbound_send_request` and `inbound_send_request`
+### 4.4 Email Search
 
-**S3** — Attachment storage; signed URLs for download; virus-scanned before storage
+```mermaid
+flowchart LR
+    client["Client"] -->|"search query"| searchSvc["Search Service"]
+    searchSvc --> elastic[("Elasticsearch")]
+    elastic -->|"snippets + IDs"| client
+    mailboxDB[("Mailbox DB")] -.->|"CDC"| elastic
+```
 
-**Elasticsearch** — Full-text search index for emails
+Full-text on subject, body, sender, recipients; filter by date, folder, label.
 
-## 4. Database Design
+### 4.5 Contact Autocomplete
+
+1. Check Redis cache: 25/50 most recently emailed contacts
+2. Cache hit: return suggestions instantly
+3. Cache miss: scan User DB for contacts in org directory
+
+## 5. Database Design
 
 ### Selection Reasoning
 
 | Store | Why |
 |---|---|
 | PostgreSQL (Mailbox DB) | Per-user email storage, ACID, relational queries for threading |
-| PostgreSQL (Draft DB) | Temporary draft storage, ACID |
-| PostgreSQL (Validation DB) | Policy and routing rules, ACID |
-| Redis (User Cache) | Fast user lookup, session store; sharded by email using consistent hashing |
+| Redis (User Cache) | Fast user lookup; sharded by email using consistent hashing |
 | Elasticsearch | Full-text search on subject, body, sender |
-| S3 | Attachment storage, large blobs, CDN-friendly |
+| S3 | Attachment storage |
 | Kafka | Async email processing pipeline |
 
-### PostgreSQL — mailbox (Outbox_Email + MailboxItem)
+### PostgreSQL — mailbox
 
 | Field | Type |
 |---|---|
@@ -138,7 +228,6 @@ Total               = 1B × 15GB = 15EB
 | message_id | UUID |
 | sender_user_id | UUID |
 | recipient_email | VARCHAR |
-| policy_user_id | UUID |
 | route_type | ENUM (INTERNAL / EXTERNAL) |
 | spam_check | ENUM (PASS / FAIL / PENDING) |
 | attachment_check | ENUM (PASS / FAIL / PENDING) |
@@ -152,165 +241,49 @@ Total               = 1B × 15GB = 15EB
 | `mx:{domain}` | String | MX record | 86400s |
 | `session:{sessionId}` | String | userId | 86400s |
 
-## 5. Key Flows
-
-### 5.1 Auth
-
-1. User logs in → User Service → validate credentials → JWT + session in Redis
-2. API Gateway validates JWT on every request
-3. User Cache sharded by email using consistent hashing — 25/50 most sent emails cached per user for autocomplete
-
-### 5.2 Outbound Email Send Flow
-
-```
-Client → Mail Send Service → Kafka (outbound_send_request)
-                                        ↓
-                              Outbox Consumer Service
-                              (spam check, policy check, validation)
-                                        ↓
-                              Outbox Delivery Orchestrator
-                                        ↓
-                    Internal?                    External?
-                       ↓                              ↓
-              Mailbox DB (recipient)         SMTP Relay Workers
-                                                      ↓
-                                              MX Resolver → MX Cache
-                                                      ↓
-                                              Receiver SMTP Server
-```
-
-1. User composes email, clicks Send → Mail Send Service
-2. Publishes to Kafka `outbound_send_request`
-3. Outbox Consumer Service consumes:
-   - Spam/Malware Filtering: score email content + attachments
-   - Policy Check: attachment size, blocked domains, DLP rules
-   - Write to Validation DB with check results
-4. If checks pass → Outbox Delivery Orchestrator
-5. Determine route: internal (same domain) or external
-6. Internal: write directly to recipient's Mailbox DB
-7. External: SMTP Relay Workers look up MX record (MX Cache → MX Resolver → DNS), connect to recipient's SMTP server, deliver via SMTP with TLS
-
-**Steps to connect to external SMTP server:**
-1. DNS MX record lookup for recipient domain (e.g., `outlook.com`)
-2. TCP connection to MX server on port 25
-3. SMTP handshake (EHLO)
-4. STARTTLS (upgrade to TLS)
-5. AUTH (if required)
-6. MAIL FROM, RCPT TO, DATA
-7. SMTP 250 OK → delivery confirmed
-
-### 5.3 Inbound Email Receive Flow
-
-```
-External SMTP → Inbound SMTP Service
-                        ↓
-              Validate sender (SPF/DKIM/DMARC)
-                        ↓
-              Kafka (inbound_send_request)
-                        ↓
-              Spam/Malware Filtering
-              Attachment Scanner → S3
-                        ↓
-              Delivery Consumer → Mailbox DB
-                        ↓
-              Notification Service → push to recipient
-```
-
-1. External server (Outlook, Yahoo) connects to our SMTP server
-2. Inbound SMTP Service validates: SPF (sender IP authorized?), DKIM (signature valid?), DMARC (policy check)
-3. Publishes to Kafka `inbound_send_request`
-4. Spam/Malware Filtering scores the email
-5. Attachment Scanner scans attachments, stores clean ones to S3
-6. Delivery Consumer writes to recipient's Mailbox DB
-7. Notification Service sends push notification to recipient
-
-### 5.4 Attachment Handling
-
-1. User attaches file → Attachment Scanner
-2. Virus scan (ClamAV or similar)
-3. File type validation (block .exe, .bat, etc.)
-4. Store to S3: `attachments/{userId}/{messageId}/{filename}`
-5. Return signed URL (valid 24hr for download)
-6. Attachment URL stored in email record
-
-### 5.5 Email Search
-
-1. Aggregator Service (CDC) captures new emails from Mailbox DB → Elasticsearch
-2. User searches "invoice from Amazon" → Search Service → Elasticsearch
-3. Full-text on subject, body, sender, recipients; filter by date, folder, label
-4. Returns matching emails with snippets
-
-### 5.6 Contact Autocomplete
-
-When user types in To field:
-1. Check local cache: `user:{userId}:contacts` — 25/50 most recently emailed contacts
-2. Cache hit: return suggestions instantly
-3. Cache miss: scan UserDB for contacts
-4. Miss: scan the UserDB table (broader directory search)
-
-**Scenarios:**
-- Sending to unknown address (first time): no autosuggestion
-- Sending to outside org: no autosuggestion (security)
-- Sending to unknown (first time override): show suggestion on click/enter
-- Sending to known (within org): show contact (on click or enter)
-
 ## 6. Key Interview Concepts
 
 ### SMTP Protocol Flow
-SMTP is the protocol for email transfer between servers. Key steps: DNS MX lookup → TCP connection → EHLO → STARTTLS → MAIL FROM → RCPT TO → DATA → 250 OK. Understanding this is essential for explaining how emails actually travel between Gmail and Outlook.
+DNS MX lookup → TCP connection → EHLO → STARTTLS → MAIL FROM → RCPT TO → DATA → 250 OK. Essential for explaining how emails travel between Gmail and Outlook.
 
 ### SPF / DKIM / DMARC
-Three DNS-based mechanisms that prove email legitimacy:
-- **SPF:** "Only these IPs can send from our domain" — DNS TXT record listing authorized sending IPs
-- **DKIM:** Cryptographic signature on email headers — receiving server verifies with public key in DNS
-- **DMARC:** Policy for what to do if SPF/DKIM fail (reject/quarantine/none) + reporting
-
-Without these, emails go to spam or are rejected. All three must be configured for good deliverability.
+- SPF: "Only these IPs can send from our domain" — DNS TXT record
+- DKIM: Cryptographic signature on email headers — verified with public key in DNS
+- DMARC: Policy for what to do if SPF/DKIM fail (reject/quarantine/none) + reporting
 
 ### MX Records and Routing
-MX (Mail Exchange) records in DNS tell senders which server handles email for a domain. `dig MX gmail.com` returns Google's mail servers. SMTP Relay Workers look up MX records to find where to deliver external emails. MX Cache avoids repeated DNS lookups for popular domains.
+MX records in DNS tell senders which server handles email for a domain. MX Cache avoids repeated DNS lookups for popular domains.
 
 ### Internal vs External Routing
-Internal emails (user@gmail.com → user2@gmail.com) never leave the system — delivered directly to Mailbox DB. External emails (user@gmail.com → user@outlook.com) go through SMTP Relay Workers. This distinction is important for latency and security.
+Internal emails (same domain) delivered directly to Mailbox DB — never leave the system. External emails go through SMTP Relay Workers.
 
 ### Spam Filtering at Scale
-5B emails/day, 60% spam = 3B spam emails to filter. Two-layer approach:
-- Fast rules (IP reputation, known spam domains, header checks) — block at SMTP level
-- ML model (content analysis, behavioral patterns) — score remaining emails
-- Threshold: score > 0.8 → spam folder; score > 0.95 → block entirely
+5B emails/day, 60% spam = 3B to filter. Two-layer: fast rules at SMTP level (IP reputation, known spam domains) + ML model for remaining emails.
 
 ### Mailbox Sharding
-1B users × 15GB = 15EB of mailbox data. Shard by `user_id` (hash-based). All emails for a user on one shard — efficient inbox queries. Hot users (high email volume) may need dedicated shards.
+1B users × 15GB = 15EB. Shard by `user_id` (hash-based). All emails for a user on one shard — efficient inbox queries.
 
 ### User Cache with Consistent Hashing
-User Service shards the User Cache across Redis nodes using consistent hashing on email address. This ensures the same user always hits the same cache node, and adding/removing nodes only moves a fraction of keys.
+Same user always hits same cache node. Adding/removing nodes only moves a fraction of keys.
 
-### Outbox Pattern for Reliability
-Mail Send Service writes to Draft DB and publishes to Kafka. If service crashes after DB write but before Kafka publish, the email is lost. Solution: outbox pattern — write to DB and outbox table in same transaction; CDC publishes to Kafka. Guarantees at-least-once delivery.
+### Outbox Pattern
+Write to DB and outbox table in same transaction; CDC publishes to Kafka. Guarantees at-least-once delivery even if service crashes between DB write and Kafka publish.
 
 ## 7. Failure Scenarios
 
 ### SMTP Relay Worker Failure
-- Detection: delivery failures, health check
 - Recovery: Kafka retains unacknowledged messages; another worker picks up; retry with exponential backoff
 - Prevention: multiple relay workers; dead letter queue for permanently failed deliveries
 
 ### Inbound SMTP Overload (Email Bomb)
-- Detection: inbound connection rate spikes
-- Recovery: rate limit per sending IP; reject connections exceeding threshold; greylisting (temporary reject → legitimate servers retry)
-- Prevention: IP reputation filtering at SMTP level before processing
+- Recovery: rate limit per sending IP; greylisting (temporary reject → legitimate servers retry)
+- Prevention: IP reputation filtering at SMTP level
 
 ### Spam Filter False Positive
-- Scenario: legitimate email marked as spam
 - Recovery: user moves to inbox → feedback signal to ML model; whitelist sender
-- Prevention: conservative threshold for blocking; aggressive threshold only for spam folder
-
-### Elasticsearch Failure
-- Impact: search unavailable; email delivery unaffected
-- Recovery: graceful degradation — show "search unavailable"; CDC replays missed emails on recovery
-- Prevention: Elasticsearch cluster with replicas
+- Prevention: conservative threshold for blocking
 
 ### Mailbox DB Failure
 - Impact: email delivery and inbox reads fail
 - Recovery: promote replica (<30s); Kafka retains inbound emails; delivery retried after recovery
-- Prevention: synchronous replication; automated failover; Kafka as durable buffer
+- Prevention: synchronous replication; automated failover
