@@ -16,6 +16,10 @@
 |---|---|---|---|---|
 |Two Sum|[leetcode link](https://leetcode.com/problems/two-sum/)|Hashmap for constant time complement lookup|P1|Easy|
 |Contains Duplicate|[leetcode link](https://leetcode.com/problems/contains-duplicate/)|HashSet to detect duplicates|P1|Easy|
+|Valid Anagram|[leetcode link](https://leetcode.com/problems/valid-anagram/)|Character frequency count comparison|P1|Easy|
+|Missing Number|[leetcode link](https://leetcode.com/problems/missing-number/)|XOR or sum formula to find missing|P1|Easy|
+|Majority Element|[leetcode link](https://leetcode.com/problems/majority-element/)|Boyer-Moore voting algorithm|P1|Easy|
+|Group Anagrams|[leetcode link](https://leetcode.com/problems/group-anagrams/)|Sorted string or frequency tuple as key|P1|Medium|
 |Subarray Sum Equals K|[leetcode link](https://leetcode.com/problems/subarray-sum-equals-k/)|Prefix sum + hashmap frequency|P1|Medium|
 |Single Number|[leetcode link](https://leetcode.com/problems/single-number/)|XOR to cancel duplicates|P1|Easy|
 |Product of Array Except Self|[leetcode link](https://leetcode.com/problems/product-of-array-except-self/)|Prefix & suffix product without division|P1|Medium|
@@ -31,14 +35,25 @@
 
 ---
 
+## **Prefix Sums**
+
+|Name|Question link|Concept|Priority|Difficulty|
+|---|---|---|---|---|
+|Range Sum Query - Immutable|[leetcode link](https://leetcode.com/problems/range-sum-query-immutable/)|Precompute prefix sums for O(1) range query|P1|Easy|
+
+---
+
 ## **Sliding Window**
 
 |Name|Question link|Concept|Priority|Difficulty|
 |---|---|---|---|---|
+|Maximum Average Subarray I|[leetcode link](https://leetcode.com/problems/maximum-average-subarray-i/)|Fixed-size sliding window|P1|Easy|
+|Minimum Size Subarray Sum|[leetcode link](https://leetcode.com/problems/minimum-size-subarray-sum/)|Variable window shrink when valid|P1|Medium|
 |Longest Substring Without Repeating Characters|[leetcode link](https://leetcode.com/problems/longest-substring-without-repeating-characters/)|Sliding window + set|P1|Medium|
 |Minimum Window Substring|[leetcode link](https://leetcode.com/problems/minimum-window-substring/)|Sliding window + frequency map|P1|Hard|
 |Fruit Into Baskets|[leetcode link](https://leetcode.com/problems/fruit-into-baskets/)|Sliding window with ≤2 distinct elements|P1|Medium|
 |Longest Repeating Character Replacement|[leetcode link](https://leetcode.com/problems/longest-repeating-character-replacement/)|Window with max frequency tracking|P1|Medium|
+|Subarray Product Less Than K|[leetcode link](https://leetcode.com/problems/subarray-product-less-than-k/)|Sliding window counting subarrays|P1|Medium|
 |Sliding Window Maximum|[leetcode link](https://leetcode.com/problems/sliding-window-maximum/)|Monotonic deque|P2|Hard|
 
 ---
@@ -48,6 +63,9 @@
 |Name|Question link|Concept|Priority|Difficulty|
 |---|---|---|---|---|
 |Valid Palindrome|[leetcode link](https://leetcode.com/problems/valid-palindrome/)|Two pointers ignoring non-alphanumeric|P1|Easy|
+|Move Zeroes|[leetcode link](https://leetcode.com/problems/move-zeroes/)|Two pointer partition in-place|P1|Easy|
+|Squares of a Sorted Array|[leetcode link](https://leetcode.com/problems/squares-of-a-sorted-array/)|Two pointer merge from both ends|P1|Easy|
+|Backspace String Compare|[leetcode link](https://leetcode.com/problems/backspace-string-compare/)|Stack or reverse two pointer|P1|Easy|
 |3Sum|[leetcode link](https://leetcode.com/problems/3sum/)|Sort + two pointers to find triplets|P1|Medium|
 |Container With Most Water|[leetcode link](https://leetcode.com/problems/container-with-most-water/)|Move smaller height pointer|P1|Medium|
 |Trapping Rain Water|[leetcode link](https://leetcode.com/problems/trapping-rain-water/)|Two pointers + prefix max|P2|Hard|
@@ -62,6 +80,7 @@
 |Find Peak Element|[leetcode link](https://leetcode.com/problems/find-peak-element/)|Binary search slope comparison|P1|Medium|
 |Search in Rotated Sorted Array|[leetcode link](https://leetcode.com/problems/search-in-rotated-sorted-array/)|Identify sorted half|P1|Medium|
 |Find Minimum in Rotated Sorted Array|[leetcode link](https://leetcode.com/problems/find-minimum-in-rotated-sorted-array/)|Binary search pivot|P1|Medium|
+|Search a 2D Matrix|[leetcode link](https://leetcode.com/problems/search-a-2d-matrix/)|Treat 2D as 1D sorted array|P1|Medium|
 |Koko Eating Bananas|[leetcode link](https://leetcode.com/problems/koko-eating-bananas/)|Binary search on answer|P1|Medium|
 |Capacity to Ship Packages Within D Days|[leetcode link](https://leetcode.com/problems/capacity-to-ship-packages-within-d-days/)|Binary search feasible capacity|P1|Medium|
 |Median of Two Sorted Arrays|[leetcode link](https://leetcode.com/problems/median-of-two-sorted-arrays/)|Partitioning technique|P2|Hard|
@@ -91,6 +110,7 @@
 |Name|Question link|Concept|Priority|Difficulty|
 |---|---|---|---|---|
 |Reverse Linked List|[leetcode link](https://leetcode.com/problems/reverse-linked-list/)|Iterative pointer reversal|P1|Easy|
+|Merge Two Sorted Lists|[leetcode link](https://leetcode.com/problems/merge-two-sorted-lists/)|Dummy head + compare and append|P1|Easy|
 |Linked List Cycle|[leetcode link](https://leetcode.com/problems/linked-list-cycle/)|Fast & slow pointers|P1|Easy|
 |Linked List Cycle II|[leetcode link](https://leetcode.com/problems/linked-list-cycle-ii/)|Find cycle start|P1|Medium|
 |Merge K Sorted Lists|[leetcode link](https://leetcode.com/problems/merge-k-sorted-lists/)|Min heap merge|P1|Hard|
@@ -98,6 +118,9 @@
 |Middle of the Linked List|[leetcode link](https://leetcode.com/problems/middle-of-the-linked-list/)|Slow & fast pointers|P1|Easy|
 |Add Two Numbers|[leetcode link](https://leetcode.com/problems/add-two-numbers/)|Simulate addition with carry|P1|Medium|
 |Intersection of Two Linked Lists|[leetcode link](https://leetcode.com/problems/intersection-of-two-linked-lists/)|Two pointer switching|P1|Easy|
+|Remove Nth Node From End of List|[leetcode link](https://leetcode.com/problems/remove-nth-node-from-end-of-list/)|Two pointers with n-node gap|P1|Medium|
+|Palindrome Linked List|[leetcode link](https://leetcode.com/problems/palindrome-linked-list/)|Find middle + reverse + compare|P1|Easy|
+|Reorder List|[leetcode link](https://leetcode.com/problems/reorder-list/)|Find middle + reverse + interleave|P1|Medium|
 |Odd Even Linked List|[leetcode link](https://leetcode.com/problems/odd-even-linked-list/)|Separate odd & even nodes|P2|Medium|
 |Reverse Nodes in K Group|[leetcode link](https://leetcode.com/problems/reverse-nodes-in-k-group/)|Reverse nodes in chunks|P2|Hard|
 
@@ -114,6 +137,18 @@
 | Minimum Arrows to Burst Balloons | [leetcode link](https://leetcode.com/problems/minimum-number-of-arrows-to-burst-balloons/) | Interval overlap             | P1       | Medium     |
 | Non Overlapping Intervals        | [leetcode link](https://leetcode.com/problems/non-overlapping-intervals/)                  | Sort by end, remove overlaps | P1       | Medium     |
 | Candy                            | [leetcode link](https://leetcode.com/problems/candy/)                                      | Two-pass greedy              | P2       | Hard       |
+
+---
+
+## **Intervals**
+
+|Name|Question link|Concept|Priority|Difficulty|
+|---|---|---|---|---|
+|Meeting Rooms|[leetcode link](https://leetcode.com/problems/meeting-rooms/)|Sort by start, check overlaps|P1|Easy|
+|Merge Intervals|[leetcode link](https://leetcode.com/problems/merge-intervals/)|Sort by start, extend end on overlap|P1|Medium|
+|Insert Interval|[leetcode link](https://leetcode.com/problems/insert-interval/)|Add before, merge overlapping, add after|P1|Medium|
+|Interval List Intersections|[leetcode link](https://leetcode.com/problems/interval-list-intersections/)|Two pointers, advance smaller end|P1|Medium|
+|Meeting Rooms II|[leetcode link](https://leetcode.com/problems/meeting-rooms-ii/)|Min heap of end times|P1|Medium|
 
 ---
 
@@ -138,6 +173,14 @@
 
 |Name|Question link|Concept|Priority|Difficulty|
 |---|---|---|---|---|
+|Climbing Stairs|[leetcode link](https://leetcode.com/problems/climbing-stairs/)|Fibonacci DP pattern|P1|Easy|
+|House Robber|[leetcode link](https://leetcode.com/problems/house-robber/)|Rob or skip DP|P1|Medium|
+|Coin Change|[leetcode link](https://leetcode.com/problems/coin-change/)|Min coins unbounded knapsack|P1|Medium|
+|Word Break|[leetcode link](https://leetcode.com/problems/word-break/)|DP with dictionary lookup|P1|Medium|
+|Longest Increasing Subsequence|[leetcode link](https://leetcode.com/problems/longest-increasing-subsequence/)|DP or binary search patience sort|P1|Medium|
+|Longest Common Subsequence|[leetcode link](https://leetcode.com/problems/longest-common-subsequence/)|2D DP on two strings|P1|Medium|
+|Longest Palindromic Substring|[leetcode link](https://leetcode.com/problems/longest-palindromic-substring/)|Expand around center|P1|Medium|
+|Maximum Product Subarray|[leetcode link](https://leetcode.com/problems/maximum-product-subarray/)|Track min and max product|P1|Medium|
 |Decode Ways|[leetcode link](https://leetcode.com/problems/decode-ways/)|DP on string|P1|Medium|
 |Unique Paths|[leetcode link](https://leetcode.com/problems/unique-paths/)|Grid DP|P1|Medium|
 |Unique Paths II|[leetcode link](https://leetcode.com/problems/unique-paths-ii/)|DP with obstacles|P1|Medium|
@@ -168,13 +211,18 @@
 |Name|Question link|Concept|Priority|Difficulty|
 |---|---|---|---|---|
 |Maximum Depth of Binary Tree|[leetcode link](https://leetcode.com/problems/maximum-depth-of-binary-tree/)|DFS height calculation|P1|Easy|
+|Invert Binary Tree|[leetcode link](https://leetcode.com/problems/invert-binary-tree/)|Recursive swap children|P1|Easy|
 |Balanced Binary Tree|[leetcode link](https://leetcode.com/problems/balanced-binary-tree/)|Check height difference|P1|Easy|
 |Same Tree|[leetcode link](https://leetcode.com/problems/same-tree/)|Recursive comparison|P1|Easy|
+|Subtree of Another Tree|[leetcode link](https://leetcode.com/problems/subtree-of-another-tree/)|Check same tree at each node|P1|Easy|
 |Search in BST|[leetcode link](https://leetcode.com/problems/search-in-a-binary-search-tree/)|BST traversal property|P1|Easy|
 |Convert Sorted Array to BST|[leetcode link](https://leetcode.com/problems/convert-sorted-array-to-binary-search-tree/)|Build balanced BST|P1|Easy|
 |Path Sum|[leetcode link](https://leetcode.com/problems/path-sum/)|DFS checking sum|P1|Easy|
 |Lowest Common Ancestor (BST)|[leetcode link](https://leetcode.com/problems/lowest-common-ancestor-of-a-binary-search-tree/)|BST property traversal|P1|Easy|
+|Binary Tree Level Order Traversal|[leetcode link](https://leetcode.com/problems/binary-tree-level-order-traversal/)|BFS with level grouping|P1|Medium|
 |Binary Tree Right Side View|[leetcode link](https://leetcode.com/problems/binary-tree-right-side-view/)|BFS level traversal|P1|Medium|
+|Validate Binary Search Tree|[leetcode link](https://leetcode.com/problems/validate-binary-search-tree/)|DFS with min/max bounds|P1|Medium|
+|Kth Smallest Element in a BST|[leetcode link](https://leetcode.com/problems/kth-smallest-element-in-a-bst/)|Inorder traversal stop at k|P1|Medium|
 |Construct Binary Tree from Preorder and Inorder|[leetcode link](https://leetcode.com/problems/construct-binary-tree-from-preorder-and-inorder-traversal/)|Tree reconstruction|P1|Medium|
 |Lowest Common Ancestor (Binary Tree)|[leetcode link](https://leetcode.com/problems/lowest-common-ancestor-of-a-binary-tree/)|Recursive search|P1|Medium|
 |Flatten Binary Tree to Linked List|[leetcode link](https://leetcode.com/problems/flatten-binary-tree-to-linked-list/)|Modify tree to linked list|P2|Medium|
@@ -220,6 +268,16 @@
 
 ---
 
+## **Matrix**
+
+|Name|Question link|Concept|Priority|Difficulty|
+|---|---|---|---|---|
+|Set Matrix Zeroes|[leetcode link](https://leetcode.com/problems/set-matrix-zeroes/)|Use first row/col as markers|P1|Medium|
+|Spiral Matrix|[leetcode link](https://leetcode.com/problems/spiral-matrix/)|Four boundary pointers traversal|P1|Medium|
+|Rotate Image|[leetcode link](https://leetcode.com/problems/rotate-image/)|Transpose then reverse rows|P1|Medium|
+
+---
+
 ## **Heap / Trie / Miscellaneous**
 
 |Name|Question link|Concept|Priority|Difficulty|
@@ -241,8 +299,10 @@
 
 | Name                         | Question link                                                                          | Concept                   | Priority | Difficulty |
 | ---------------------------- | -------------------------------------------------------------------------------------- | ------------------------- | -------- | ---------- |
+| Number of 1 Bits             | [leetcode link](https://leetcode.com/problems/number-of-1-bits/)                       | Count set bits (n & n-1)  | P1       | Easy       |
 | Power of Two                 | [leetcode link](https://leetcode.com/problems/power-of-two/)                           | Bit manipulation          | P1       | Easy       |
 | Hamming Distance             | [leetcode link](https://leetcode.com/problems/hamming-distance/)                       | Count differing bits      | P1       | Easy       |
+| Sum of Two Integers          | [leetcode link](https://leetcode.com/problems/sum-of-two-integers/)                    | XOR + AND carry bit math  | P1       | Medium     |
 | Happy Number                 | [leetcode link](https://leetcode.com/problems/happy-number/)                           | Cycle detection           | P1       | Easy       |
 | Plus One                     | [leetcode link](https://leetcode.com/problems/plus-one/)                               | Digit carry               | P1       | Easy       |
 | Excel Sheet Column Number    | [leetcode link](https://leetcode.com/problems/excel-sheet-column-number/)              | Base conversion           | P1       | Easy       |
