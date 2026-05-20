@@ -9,6 +9,7 @@ A collection of resources I put together for software engineering interview prep
 - [DSA](#dsa)
 - [High Level Design](#high-level-design)
 - [Low Level Design](#low-level-design)
+- [API and Database Design](#api-and-database-design)
 - [How to Use](#how-to-use)
 - [Prerequisites](#prerequisites)
 
@@ -49,9 +50,13 @@ interview-guide/
 ├── lld/
 │   ├── design-patterns/            # SOLID, design patterns
 │   └── example-systems/            # LLD examples (parking lot, elevator, etc.)
+├── api-db/
+│   ├── concepts/                   # API + schema design concepts
+│   └── example-systems/            # API + DB design examples
 ├── DSA Interviews.md
 ├── High Level Design Interviews.md
-└── Low Level Design Interviews.md
+├── Low Level Design Interviews.md
+└── api-db/API and Database Design Interviews.md
 ```
 
 ## DSA
@@ -110,6 +115,14 @@ See [Low Level Design Interviews.md](Low%20Level%20Design%20Interviews.md) for t
 The `lld/` folder contains:
 - `design-patterns/` - SOLID principles, common design patterns
 - `example-systems/` - Parking lot, elevator system, and other classic LLD problems
+
+## API and Database Design
+
+See [API and Database Design Interviews.md](api-db/API%20and%20Database%20Design%20Interviews.md) for the overview.
+
+The `api-db/` folder contains:
+- `concepts/` - API design and database schema design concepts
+- `example-systems/` - Combined API + DB design interview examples
 
 ## How to Use
 
